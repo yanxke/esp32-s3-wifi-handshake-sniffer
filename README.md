@@ -16,7 +16,7 @@ ESP32-S3 WiFi Handshake Sniffer 是一个基于 ESP32-S3、PlatformIO 和 Arduin
 - 支持整信道监听模式
 - 被动监听 EAPOL 握手包
 - 检测 WPA/WPA2 四次握手进度
-- 提取 PMKID，并导出 hashcat `.22000` 格式
+- 提取 PMKID，并按 hashcat `.22000` 的 `WPA*01*` 格式导出
 - 导出带 Radiotap 头的 `.pcap` 文件
 - 将当前和历史会话的 PCAP、PMKID 和 JSON 元数据保存到 LittleFS
 - 使用 NVS 保存语言、抓包配置和启动时自动抓包选项
@@ -121,7 +121,7 @@ This project is intended for authorized WiFi security testing, lab research, and
 - Full current-channel monitor mode
 - Passive EAPOL handshake detection
 - WPA/WPA2 four-way handshake progress tracking
-- PMKID extraction with hashcat `.22000` export
+- PMKID extraction with hashcat `.22000` `WPA*01*` export
 - `.pcap` export with Radiotap headers
 - Current and archived PCAP, PMKID, and JSON metadata saved to LittleFS
 - NVS-persisted language, capture configuration, and last capture-running state

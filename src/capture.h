@@ -17,12 +17,12 @@ extern uint32_t pmkidCount;
 extern uint8_t  captureChannel;
 
 void setup();
-void start(uint8_t channel, const uint8_t* targetBSSID, bool fullChannel = false);
+void start(uint8_t channel, const uint8_t* targetBSSID, bool fullChannel = false, const char* essid = nullptr);
 void stop();
 void loop();
 void reset();
 void startSaved(bool preserveSavedFiles = true);
-void saveConfiguration(uint8_t channel, const uint8_t* targetBSSID, bool fullChannel);
+void saveConfiguration(uint8_t channel, const uint8_t* targetBSSID, bool fullChannel, const char* essid = nullptr);
 bool hasSavedConfig();
 bool isAutoStartEnabled();
 void setAutoStartEnabled(bool enabled);

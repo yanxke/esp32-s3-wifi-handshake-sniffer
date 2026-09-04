@@ -238,7 +238,7 @@ async function toggleLanguage(){english=!english;applyLanguage();try{await fetch
 async function saveCaptureConfig(){
   const mode=$('capMode').value, bssid=$('capBssid').value.trim(), channel=parseInt($('capChannel').value,10)||1;
   if(mode!=='full'&&!/^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/.test(bssid))return;
-  try{await fetch('/api/capture/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,bssid:bssid,channel:channel})})}catch(e){}
+  try{await fetch('/api/capture/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,bssid:bssid,channel:channel,ssid:selectedSsid})})}catch(e){}
 }
 
 window.addEventListener('DOMContentLoaded',()=>{toggleMode();loadPreferences();loadSavedFiles();pollStatus();setInterval(pollStatus,2000);setInterval(loadSavedFiles,10000)})
@@ -255,6 +255,7 @@ async function scanNetworks(){
   $('scanBtn').disabled=false
 }
 
+var selectedSsid='';
 function renderTable(nets){
   const body=$('scanBody');
   if(!nets||!nets.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:20px">'+(english?'No APs found':'未发现 AP')+'</td></tr>';return}
@@ -266,7 +267,7 @@ function renderTable(nets){
     h+='<td>'+(n.rssi??'')+'</td>';
     h+='<td>'+(n.channel??'')+'</td>';
     h+='<td>'+esc(encMap(n.encryption))+'</td>';
-    h+='<td><button class="ghost" type="button" data-bssid="'+esc(n.bssid||'')+'" data-channel="'+(n.channel||1)+'">'+(english?'Select':'选择')+'</button></td>';
+    h+='<td><button class="ghost" type="button" data-ssid="'+esc(n.ssid==='<hidden>'?'':(n.ssid||''))+'" data-bssid="'+esc(n.bssid||'')+'" data-channel="'+(n.channel||1)+'">'+(english?'Select':'选择')+'</button></td>';
     h+='</tr>';
   });
   body.innerHTML=h
@@ -277,6 +278,7 @@ document.addEventListener('click',e=>{
   if(!btn)return;
   $('capBssid').value=btn.dataset.bssid||'';
   $('capChannel').value=btn.dataset.channel||'1';
+  selectedSsid=btn.dataset.ssid||'';
   $('capMode').value='target';
   toggleMode();
   saveCaptureConfig();
@@ -287,7 +289,7 @@ async function captureStart(){
   const bssid=$('capBssid').value.trim();
   const channel=parseInt($('capChannel').value,10)||1;
   if(mode!=='full'&&!bssid){alert(english?'Enter a target BSSID':'请输入目标 BSSID');return}
-  pendingCaptureBody={mode:mode,bssid:bssid,channel:channel};
+  pendingCaptureBody={mode:mode,bssid:bssid,channel:channel,ssid:selectedSsid};
   beginCountdown()
 }
 
@@ -495,12 +497,14 @@ static void handleScan() {
 static void handleCaptureStart() {
     String mode = "target";
     String bssidStr = "";
+    String ssid = "";
     int channel = 1;
 
     if (server.hasArg("plain")) {
         String body = server.arg("plain");
         mode = parseJsonString(body, "mode", "target");
         bssidStr = parseJsonString(body, "bssid", "");
+        ssid = parseJsonString(body, "ssid", "");
         channel = parseJsonInt(body, "channel", 1);
     }
 
@@ -517,7 +521,7 @@ static void handleCaptureStart() {
         return;
     }
 
-    Capture::start((uint8_t)channel, fullMode ? nullptr : bssid, fullMode);
+    Capture::start((uint8_t)channel, fullMode ? nullptr : bssid, fullMode, ssid.c_str());
     if (!Capture::isRunning) {
         String msg = Capture::getLastError();
         if (!msg.length()) msg = "capture start failed";
@@ -536,6 +540,7 @@ static void handleCaptureConfig() {
     String body = server.arg("plain");
     String mode = parseJsonString(body, "mode", "target");
     String bssidText = parseJsonString(body, "bssid", "");
+    String ssid = parseJsonString(body, "ssid", "");
     int channel = parseJsonInt(body, "channel", 1);
     if (channel < 1 || channel > 14) {
         sendJson(400, "{\"status\":\"error\",\"msg\":\"invalid channel\"}");
@@ -548,7 +553,7 @@ static void handleCaptureConfig() {
         sendJson(400, "{\"status\":\"error\",\"msg\":\"invalid bssid\"}");
         return;
     }
-    Capture::saveConfiguration((uint8_t)channel, fullMode ? nullptr : bssid, fullMode);
+    Capture::saveConfiguration((uint8_t)channel, fullMode ? nullptr : bssid, fullMode, ssid.c_str());
     Serial.printf("[Web] Capture configuration saved: mode=%s channel=%d bssid=%s\n",
                   fullMode ? "full" : "target", channel,
                   fullMode ? "<all>" : bssidText.c_str());

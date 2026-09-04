@@ -42,6 +42,7 @@ bool     resumeOnBoot = false;
 uint8_t savedChannel = 1;
 uint8_t savedBssid[6] = {0};
 char    savedBssidText[18] = "";
+String  savedEssid;
 bool     apActive         = true;
 bool     fsReady          = false;
 bool     latestPcapKnown  = false;
@@ -74,6 +75,7 @@ File pcapFile;
 std::array<uint8_t, PCAP_CHUNK> pcapActiveBuf;
 std::array<uint8_t, PCAP_CHUNK> pcapFlushBuf;
 String pmkidBuf;
+String captureEssid;
 std::array<std::array<uint8_t, 16>, MAX_PMKID> pmkidList;
 std::array<std::array<uint8_t, 6>, MAX_PMKID>  pmkidApList;
 std::array<std::array<uint8_t, 6>, MAX_PMKID>  pmkidStaList;
@@ -531,9 +533,10 @@ bool parseSavedBssid(const char* text, uint8_t out[6]) {
     return true;
 }
 
-void saveCaptureConfig(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
+void saveCaptureConfig(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* essid) {
     savedChannel = channel;
     savedFullChannel = fullChannel;
+    savedEssid = (essid && !fullChannel) ? String(essid) : String();
     const bool channelWritten = capturePreferences.putUChar("channel", channel) == sizeof(channel);
     const bool modeWritten = capturePreferences.putBool("full", fullChannel) == sizeof(uint8_t);
     bool bssidWritten = false;
@@ -560,10 +563,13 @@ void saveCaptureConfig(uint8_t channel, const uint8_t* bssid, bool fullChannel) 
     const String storedBssid = capturePreferences.isKey("bssid")
                                    ? capturePreferences.getString("bssid", "")
                                    : String();
-    const bool verified = channelWritten && modeWritten && bssidWritten &&
+    const bool essidWritten = capturePreferences.putString("ssid", savedEssid) == savedEssid.length();
+    const String storedEssid = capturePreferences.getString("ssid", "");
+    const bool verified = channelWritten && modeWritten && bssidWritten && essidWritten &&
                           storedChannel == channel &&
                           storedFullChannel == fullChannel &&
-                          (fullChannel ? storedBssid.length() == 0 : storedBssid == savedBssidText);
+                          (fullChannel ? storedBssid.length() == 0 : storedBssid == savedBssidText) &&
+                          storedEssid == savedEssid;
     savedConfigValid = verified;
 
     Serial.printf("[Capture] NVS config save: write=%s verify=%s mode=%s channel=%u bssid=%s\n",
@@ -782,6 +788,7 @@ void setup() {
     String savedBssidString = capturePreferences.isKey("bssid")
                                  ? capturePreferences.getString("bssid", "")
                                  : String();
+    savedEssid = capturePreferences.getString("ssid", "");
     savedBssidString.toCharArray(savedBssidText, sizeof(savedBssidText));
     savedConfigValid = capturePreferences.isKey("channel") &&
                        (savedFullChannel || parseSavedBssid(savedBssidText, savedBssid));
@@ -801,7 +808,7 @@ void setup() {
     }
 }
 
-void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
+void start(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* essid) {
     if (isRunning) stop();
 
     lastError[0] = '\0';
@@ -810,7 +817,8 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
         return;
     }
 
-    saveCaptureConfig(channel, bssid, fullChannel);
+    saveCaptureConfig(channel, bssid, fullChannel, essid);
+    captureEssid = (essid && !fullChannel) ? String(essid) : String();
     resumeOnBoot = true;
     const bool resumeWritten = capturePreferences.putBool("resume", true) == sizeof(uint8_t);
     Serial.printf("[Capture] Resume-on-boot state saved: %s\n", resumeWritten ? "running" : "FAILED");
@@ -900,10 +908,10 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
     Serial.println("[Capture] Waiting for matching traffic...");
 }
 
-void saveConfiguration(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
+void saveConfiguration(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* essid) {
     if (channel < 1 || channel > 14) return;
     if (!fullChannel && !bssid) return;
-    saveCaptureConfig(channel, bssid, fullChannel);
+    saveCaptureConfig(channel, bssid, fullChannel, essid);
 }
 
 void startSaved(bool preserveSavedFiles) {
@@ -911,9 +919,9 @@ void startSaved(bool preserveSavedFiles) {
     if (!savedConfigValid) {
         start(1, nullptr, true);
     } else if (savedFullChannel) {
-        start(savedChannel, nullptr, true);
+        start(savedChannel, nullptr, true, nullptr);
     } else {
-        start(savedChannel, savedBssid, false);
+        start(savedChannel, savedBssid, false, savedEssid.c_str());
     }
     preserveSavedFilesOnStart = false;
 }
@@ -1136,18 +1144,29 @@ const char* getPmkidData() {
     pmkidBuf = "";
     pmkidBuf.reserve(pmkidStored * 64);
     for (int i = 0; i < pmkidStored; ++i) {
-        char apStr[18], staStr[18], pmkidHex[33];
+        char apStr[18], staStr[18], pmkidHex[33], essidHex[65];
         macStr(pmkidApList[i].data(), apStr);
         macStr(pmkidStaList[i].data(), staStr);
         for (int j = 0; j < 16; ++j) {
             snprintf(pmkidHex + j * 2, 3, "%02X", pmkidList[i][j]);
         }
-        pmkidBuf += "WPA*02*";
+        const size_t essidLen = captureEssid.length() > 32 ? 32 : captureEssid.length();
+        for (size_t j = 0; j < essidLen; ++j) {
+            snprintf(essidHex + j * 2, 3, "%02X", (uint8_t)captureEssid[j]);
+        }
+        essidHex[essidLen * 2] = '\0';
+        // PMKID records use signature 01 in hashcat's WPA 22000 format.
+        // Signature 02 is for full EAPOL records (MIC, ESSID, nonce,
+        // normalized EAPOL data, and message-pair metadata), which are not
+        // represented by the PMKID buffers above.
+        pmkidBuf += "WPA*01*";
         pmkidBuf += pmkidHex;
         pmkidBuf += "*";
         pmkidBuf += apStr;
         pmkidBuf += "*";
         pmkidBuf += staStr;
+        pmkidBuf += "*";
+        pmkidBuf += essidHex;
         pmkidBuf += "***\n";
     }
     return pmkidBuf.c_str();
