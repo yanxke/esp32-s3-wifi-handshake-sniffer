@@ -18,8 +18,9 @@ ESP32-S3 WiFi Handshake Sniffer 是一个基于 ESP32-S3、PlatformIO 和 Arduin
 - 检测 WPA/WPA2 四次握手进度
 - 提取 PMKID，并导出 hashcat `.22000` 格式
 - 导出带 Radiotap 头的 `.pcap` 文件
-- 将最近一次抓包的 PCAP、PMKID 和 JSON 元数据保存到 LittleFS
-- 支持串口命令查看状态和停止抓包
+- 将当前和历史会话的 PCAP、PMKID 和 JSON 元数据保存到 LittleFS
+- 使用 NVS 保存语言、抓包配置和启动时自动抓包选项
+- 支持周期性串口状态报告，以及查看状态和停止抓包的串口命令
 
 ## 硬件与环境
 
@@ -46,8 +47,28 @@ board_build.flash_mode = qio
 3. 连接设备创建的 WiFi 热点：
 
 ```text
-esp32-s3-wifi-handshake-sniffer
+esp32-s3-whs
 ```
+
+默认密码：`changeme`
+
+抓包结果保存在设备的 LittleFS Flash 分区：
+
+- `/latest_capture.pcap`
+- `/latest_capture.22000`
+- `/latest_capture.json`
+
+开始新的抓包会将上一会话归档为 `/session_XXXXXX.pcap`、`.22000` 和 `.json` 文件；设备重启不会清除这些文件。Web UI 的“所有已保存会话”区域可分别下载各个文件；“清除已保存”会清除当前和已归档会话。
+
+## BOOT 按钮与 RGB 指示灯
+
+- BOOT 按钮（GPIO0）按下后会开始或停止抓包。
+- 开始抓包时，设备使用 NVS 中保存的抓包配置；如果没有保存配置，则使用信道 1 的全信道模式。
+- 设备会自动记住上次运行状态：如果重启前正在抓包，启动后会自动使用已保存配置恢复抓包；如果重启前处于空闲，则保持空闲。BOOT 按钮始终使用已保存的配置开始抓包。
+- RGB 灯（GPIO48）绿色常亮表示空闲。
+- 黄色常亮表示正在抓包但尚未捕获数据包。
+- 捕获数据包后黄色闪烁，初始为每 2 秒一个闪烁周期，随着数据包数量增加加快，最高 5 Hz。
+- 检测到 PMKID（`.22000` 内容非空）后，闪烁颜色变为橙色。
 
 4. 打开设备管理页面，默认地址通常为：
 
@@ -67,11 +88,14 @@ status - 输出当前抓包状态
 stop   - 停止抓包，保存结果，并恢复管理热点
 ```
 
+设备还会输出每次扫描的 SSID、BSSID、信道、RSSI 和加密类型，并周期性输出抓包数量、文件大小以及 LittleFS 空间使用情况。
+
 ## 输出文件
 
 - `latest_capture.pcap`：最近一次抓包结果，可用于 Wireshark 等工具分析
 - `latest_capture.22000`：PMKID hashcat 22000 格式输出
 - `latest_capture.json`：抓包会话元数据，包括信道、帧数量、EAPOL/PMKID 数量和耗时等
+- `session_XXXXXX.*`：历史会话归档文件
 
 ## 注意事项
 
@@ -99,8 +123,84 @@ This project is intended for authorized WiFi security testing, lab research, and
 - WPA/WPA2 four-way handshake progress tracking
 - PMKID extraction with hashcat `.22000` export
 - `.pcap` export with Radiotap headers
-- Latest PCAP, PMKID, and JSON metadata saved to LittleFS
-- Serial commands for status, stop, and help
+- Current and archived PCAP, PMKID, and JSON metadata saved to LittleFS
+- NVS-persisted language, capture configuration, and last capture-running state
+- Periodic serial status reporting and commands for status, stop, and help
+
+## Hardware And Environment
+
+- ESP32-S3 DevKitC-1
+- PlatformIO
+- Arduino framework for ESP32
+
+The default project configuration is in `platformio.ini`:
+
+```ini
+[env:esp32-s3-devkitc-1]
+platform = espressif32
+board = esp32-s3-devkitc-1
+framework = arduino
+monitor_speed = 115200
+upload_speed = 921600
+board_build.flash_mode = qio
+board_build.partitions = partitions_8MB_nota.csv
+```
+
+## Usage
+
+1. Build and flash the firmware with PlatformIO.
+2. Open the serial monitor and wait for the device to boot.
+3. Connect to the management WiFi network:
+
+```text
+SSID:    esp32-s3-whs
+Password: changeme
+```
+
+Capture files are stored in the device’s LittleFS flash partition:
+
+- `/latest_capture.pcap`
+- `/latest_capture.22000`
+- `/latest_capture.json`
+
+When a new capture starts, the previous session is archived as `/session_XXXXXX.pcap`, `.22000`, and `.json`. Reboots do not clear saved files. The Web UI lists all saved files for individual download; “Clear saved” removes current and archived sessions.
+
+Open the management page at `http://192.168.4.1/`. Scan nearby APs, select a target network, and start listening. The management AP temporarily closes during capture and returns after capture stops. Reconnect afterward to download the results.
+
+## Serial Commands
+
+```text
+help   - show the command list
+status - print detailed capture and LittleFS status
+stop   - stop capture, save results, and restore the management AP
+```
+
+The device also prints each scanned SSID, BSSID, channel, RSSI, and security type, plus periodic capture statistics including packet counts, file sizes, and LittleFS space.
+
+## Output Files
+
+- `latest_capture.pcap`: latest capture, suitable for analysis with Wireshark and similar tools
+- `latest_capture.22000`: PMKID output in Hashcat 22000 format
+- `latest_capture.json`: capture metadata including channel, frame counts, EAPOL/PMKID counts, and elapsed time
+- `session_XXXXXX.*`: archived files from previous sessions
+
+## Notes
+
+- Listening must be fixed to the target channel.
+- The target network needs a client reconnect or other handshake-related traffic for EAPOL frames to be captured.
+- Full-channel mode means all matching frames on the selected single channel; it does not hop channels automatically.
+- The management AP is disabled during capture and restored afterward.
+- The project does not send deauthentication frames; it performs passive monitoring only.
+
+## BOOT Button And RGB LED
+
+- Press the BOOT button (GPIO0) to start or stop capture.
+- Capture starts with the configuration saved in NVS. If no configuration has been saved, it uses full-channel mode on channel 1.
+- Enable “Start the saved configuration at boot” in the Web UI to begin capture automatically during boot.
+- Solid green RGB (GPIO48) means idle.
+- Solid yellow means capture is running but no packets have been captured yet.
+- After packets are captured, the LED blinks yellow, starting at one cycle every 2 seconds and increasing up to 5 Hz as the packet count grows.
+- After a PMKID is detected (non-empty `.22000` data), the blinking color changes to orange.
 
 ## Build And Flash
 

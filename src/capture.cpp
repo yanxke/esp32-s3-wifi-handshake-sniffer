@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 
@@ -20,16 +21,27 @@ uint32_t eapolCount     = 0;
 uint32_t pmkidCount     = 0;
 uint8_t  captureChannel = 1;
 
+const char* getPmkidData();
+
 namespace {
 
-constexpr const char* kMgmtApSsid = "esp32-s3-wifi-handshake-sniffer";
+constexpr const char* kMgmtApSsid = "esp32-s3-whs";
+constexpr const char* kMgmtApPassword = "changeme";
 constexpr const char* kLatestPcapPath = "/latest_capture.pcap";
 constexpr const char* kLatestPmkidPath = "/latest_capture.22000";
 constexpr const char* kLatestMetaPath = "/latest_capture.json";
 constexpr size_t PCAP_CHUNK = 8 * 1024;
 constexpr size_t MAX_PMKID = 10;
+constexpr uint32_t CHECKPOINT_INTERVAL_MS = 60000;
 
 bool     fullChannelMode  = false;
+Preferences capturePreferences;
+bool     savedConfigValid = false;
+bool     savedFullChannel = true;
+bool     resumeOnBoot = false;
+uint8_t savedChannel = 1;
+uint8_t savedBssid[6] = {0};
+char    savedBssidText[18] = "";
 bool     apActive         = true;
 bool     fsReady          = false;
 bool     latestPcapKnown  = false;
@@ -41,6 +53,9 @@ char     lastError[160]   = "";
 size_t   pcapWritePos     = 0;
 uint32_t startMs          = 0;
 uint32_t lastDiagMs       = 0;
+uint32_t lastCheckpointMs = 0;
+size_t   lastCheckpointPcapPos = 0;
+uint32_t lastCheckpointPmkidCount = 0;
 bool     firstFrameSeen   = false;
 bool     idleWarningShown = false;
 uint32_t rawChannelFrames = 0;
@@ -51,6 +66,9 @@ size_t   pcapActivePos = 0;
 size_t   pcapFlushLen = 0;
 bool     pcapFlushPending = false;
 bool     pcapFileOpen = false;
+bool     preserveSavedFilesOnStart = false;
+bool     pmkidCheckpointPending = false;
+uint32_t nextSessionId = 1;
 
 File pcapFile;
 std::array<uint8_t, PCAP_CHUNK> pcapActiveBuf;
@@ -60,6 +78,8 @@ std::array<std::array<uint8_t, 16>, MAX_PMKID> pmkidList;
 std::array<std::array<uint8_t, 6>, MAX_PMKID>  pmkidApList;
 std::array<std::array<uint8_t, 6>, MAX_PMKID>  pmkidStaList;
 int pmkidStored = 0;
+
+String buildSessionMetaJson(uint32_t elapsedSec);
 
 struct HandshakeState {
     uint8_t ap[6] = {0};
@@ -99,10 +119,17 @@ uint16_t ch2flags(uint16_t f) {
 
 void startManagementAp() {
     WiFi.persistent(false);
+    // esp_wifi_stop() is used by capture mode. Force a clean Arduino Wi-Fi
+    // state before starting the management AP again.
+    WiFi.mode(WIFI_MODE_NULL);
+    delay(50);
     WiFi.mode(WIFI_MODE_APSTA);
-    WiFi.softAP(kMgmtApSsid, nullptr, 1, 0, 4);
-    apActive = true;
-    Serial.println("[Capture] Management AP restored");
+    const bool started = WiFi.softAP(kMgmtApSsid, kMgmtApPassword, 1, 0, 4);
+    apActive = started;
+    Serial.printf("[Capture] Management AP %s, SSID=%s IP=%s\n",
+                  started ? "restored" : "restart failed",
+                  kMgmtApSsid,
+                  WiFi.softAPIP().toString().c_str());
 }
 
 void stopManagementAp() {
@@ -195,6 +222,7 @@ void addPmkid(const uint8_t* pmkid, const uint8_t* ap, const uint8_t* sta) {
     pmkidStored++;
     pmkidCount = pmkidStored;
     pmkidFound = true;
+    pmkidCheckpointPending = true;
     char apStr[18], staStr[18];
     macStr(pmkidApList[pmkidStored - 1].data(), apStr);
     macStr(pmkidStaList[pmkidStored - 1].data(), staStr);
@@ -292,21 +320,37 @@ String buildSessionMetaJson(uint32_t elapsedSec) {
     return out;
 }
 
-bool fileExistsNoisySafe(const char* path) {
+bool findFileQuiet(const char* path, size_t* sizeOut = nullptr) {
     if (!fsReady) return false;
-    File f = LittleFS.open(path, FILE_READ);
-    if (!f) return false;
-    f.close();
-    return true;
+    File root = LittleFS.open("/");
+    if (!root) return false;
+
+    bool found = false;
+    File file = root.openNextFile();
+    while (file) {
+        String name = file.name();
+        if (!name.startsWith("/")) name = "/" + name;
+        if (name == path) {
+            if (sizeOut) *sizeOut = file.size();
+            found = true;
+            file.close();
+            break;
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    return found;
+}
+
+bool fileExistsNoisySafe(const char* path) {
+    return findFileQuiet(path);
 }
 
 size_t fileSizeNoisySafe(const char* path) {
-    if (!fsReady) return 0;
-    File f = LittleFS.open(path, FILE_READ);
-    if (!f) return 0;
-    size_t sz = f.size();
-    f.close();
-    return sz;
+    size_t size = 0;
+    findFileQuiet(path, &size);
+    return size;
 }
 
 void analyzeKey(const uint8_t* pkt, uint16_t len, int off) {
@@ -476,6 +520,174 @@ void flushActivePcapChunk() {
     }
 }
 
+bool parseSavedBssid(const char* text, uint8_t out[6]) {
+    if (!text || strlen(text) != 17) return false;
+    unsigned values[6];
+    int n = sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x",
+                   &values[0], &values[1], &values[2],
+                   &values[3], &values[4], &values[5]);
+    if (n != 6) return false;
+    for (int i = 0; i < 6; ++i) out[i] = (uint8_t)values[i];
+    return true;
+}
+
+void saveCaptureConfig(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
+    savedChannel = channel;
+    savedFullChannel = fullChannel;
+    const bool channelWritten = capturePreferences.putUChar("channel", channel) == sizeof(channel);
+    const bool modeWritten = capturePreferences.putBool("full", fullChannel) == sizeof(uint8_t);
+    bool bssidWritten = false;
+    if (bssid) {
+        memcpy(savedBssid, bssid, sizeof(savedBssid));
+        // NVS uses the same colon-separated representation that
+        // parseSavedBssid() expects during boot. Keep macStr() compact for
+        // capture diagnostics and generated metadata.
+        snprintf(savedBssidText, sizeof(savedBssidText),
+                 "%02X:%02X:%02X:%02X:%02X:%02X",
+                 savedBssid[0], savedBssid[1], savedBssid[2],
+                 savedBssid[3], savedBssid[4], savedBssid[5]);
+        bssidWritten = capturePreferences.putString("bssid", savedBssidText) == strlen(savedBssidText);
+    } else {
+        memset(savedBssid, 0, sizeof(savedBssid));
+        savedBssidText[0] = '\0';
+        bssidWritten = !capturePreferences.isKey("bssid") || capturePreferences.remove("bssid");
+    }
+
+    // Preferences commits each put operation synchronously. Read all fields
+    // back immediately so a failed NVS write cannot look like a saved config.
+    const uint8_t storedChannel = capturePreferences.getUChar("channel", 0);
+    const bool storedFullChannel = capturePreferences.getBool("full", !fullChannel);
+    const String storedBssid = capturePreferences.isKey("bssid")
+                                   ? capturePreferences.getString("bssid", "")
+                                   : String();
+    const bool verified = channelWritten && modeWritten && bssidWritten &&
+                          storedChannel == channel &&
+                          storedFullChannel == fullChannel &&
+                          (fullChannel ? storedBssid.length() == 0 : storedBssid == savedBssidText);
+    savedConfigValid = verified;
+
+    Serial.printf("[Capture] NVS config save: write=%s verify=%s mode=%s channel=%u bssid=%s\n",
+                  (channelWritten && modeWritten && bssidWritten) ? "ok" : "FAIL",
+                  verified ? "ok" : "FAIL",
+                  storedFullChannel ? "full" : "target",
+                  storedChannel,
+                  storedBssid.length() ? storedBssid.c_str() : "<all>");
+}
+
+void archiveExistingSession() {
+    if (!fsReady) return;
+
+    const size_t pcapSize = fileSizeNoisySafe(kLatestPcapPath);
+    const size_t pmkidSize = fileSizeNoisySafe(kLatestPmkidPath);
+    const size_t metaSize = fileSizeNoisySafe(kLatestMetaPath);
+    const bool hasPcap = pcapSize > sizeof(PCAP_GHDR);
+    const bool hasPmkid = pmkidSize > 0;
+    const bool hasMeta = metaSize > 0;
+    Serial.printf("[Capture] Archive check: %s=%u B %s=%u B %s=%u B\n",
+                  kLatestPcapPath, (unsigned)pcapSize,
+                  kLatestPmkidPath, (unsigned)pmkidSize,
+                  kLatestMetaPath, (unsigned)metaSize);
+    if (!hasPcap && !hasPmkid && !hasMeta) {
+        Serial.println("[Capture] Archive check: no completed latest files found");
+        return;
+    }
+
+    char id[12];
+    snprintf(id, sizeof(id), "%06lu", (unsigned long)nextSessionId++);
+    capturePreferences.putUInt("nextid", nextSessionId);
+
+    char archivedPcap[40], archivedPmkid[40], archivedMeta[40];
+    snprintf(archivedPcap, sizeof(archivedPcap), "/session_%s.pcap", id);
+    snprintf(archivedPmkid, sizeof(archivedPmkid), "/session_%s.22000", id);
+    snprintf(archivedMeta, sizeof(archivedMeta), "/session_%s.json", id);
+
+    bool ok = true;
+    if (hasPcap) {
+        const bool renamed = LittleFS.rename(kLatestPcapPath, archivedPcap);
+        Serial.printf("[Capture] Rename %s -> %s: %s\n", kLatestPcapPath, archivedPcap, renamed ? "ok" : "FAIL");
+        ok = renamed && ok;
+    }
+    if (hasPmkid) {
+        const bool renamed = LittleFS.rename(kLatestPmkidPath, archivedPmkid);
+        Serial.printf("[Capture] Rename %s -> %s: %s\n", kLatestPmkidPath, archivedPmkid, renamed ? "ok" : "FAIL");
+        ok = renamed && ok;
+    }
+    if (hasMeta) {
+        const bool renamed = LittleFS.rename(kLatestMetaPath, archivedMeta);
+        Serial.printf("[Capture] Rename %s -> %s: %s\n", kLatestMetaPath, archivedMeta, renamed ? "ok" : "FAIL");
+        ok = renamed && ok;
+    }
+    Serial.printf("[Capture] Archived session %s: %s\n", id, ok ? "ok" : "partial/fail");
+}
+
+void logSavedFiles() {
+    if (!fsReady) return;
+    File root = LittleFS.open("/");
+    if (!root) {
+        Serial.println("[Capture] Filesystem listing failed");
+        return;
+    }
+    uint16_t count = 0;
+    File file = root.openNextFile();
+    while (file) {
+        Serial.printf("[Capture] File found: %s (%u B)\n", file.name(), (unsigned)file.size());
+        count++;
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    Serial.printf("[Capture] Filesystem listing complete: %u file(s)\n", count);
+}
+
+void checkpointCapture(bool savePcap, bool savePmkid) {
+    if (!fsReady) return;
+
+    if (savePcap) {
+        // Make all complete records currently buffered in RAM durable first.
+        flushPendingPcapChunk();
+        flushActivePcapChunk();
+        if (pcapFileOpen) {
+            pcapFile.flush();
+            latestPcapKnown = fileSizeNoisySafe(kLatestPcapPath) > sizeof(PCAP_GHDR);
+        }
+    }
+
+    size_t pmkidSize = 0;
+    if (savePmkid) {
+        const char* pmkidData = getPmkidData();
+        pmkidSize = strlen(pmkidData);
+        if (fileExistsNoisySafe(kLatestPmkidPath)) LittleFS.remove(kLatestPmkidPath);
+        File pmkidFile = LittleFS.open(kLatestPmkidPath, FILE_WRITE, true);
+        bool pmkidSaved = false;
+        if (pmkidFile) {
+            pmkidSaved = pmkidFile.write((const uint8_t*)pmkidData, pmkidSize) == pmkidSize;
+            pmkidFile.flush();
+            pmkidFile.close();
+        }
+        latestPmkidKnown = pmkidSaved && pmkidSize > 0;
+    }
+
+    String meta = buildSessionMetaJson((millis() - startMs) / 1000);
+    if (fileExistsNoisySafe(kLatestMetaPath)) LittleFS.remove(kLatestMetaPath);
+    File metaFile = LittleFS.open(kLatestMetaPath, FILE_WRITE, true);
+    bool metaSaved = false;
+    if (metaFile) {
+        metaSaved = metaFile.print(meta) == meta.length();
+        metaFile.flush();
+        metaFile.close();
+    }
+    latestMetaKnown = metaSaved;
+
+    Serial.printf("[Capture] Checkpoint: pcap=%u B pmkid=%u B meta=%s\n",
+                  (unsigned)fileSizeNoisySafe(kLatestPcapPath),
+                  (unsigned)pmkidSize,
+                  metaSaved ? "ok" : "fail");
+
+    lastCheckpointPcapPos = pcapWritePos;
+    lastCheckpointPmkidCount = pmkidCount;
+    pmkidCheckpointPending = false;
+}
+
 void closePcapFile() {
     if (!pcapFileOpen) return;
     flushPendingPcapChunk();
@@ -530,7 +742,7 @@ void rxCallback(void* buf, wifi_promiscuous_pkt_type_t) {
                       (unsigned long)((millis() - startMs) / 1000));
     }
     frameCount++;
-    if ((frameCount % 100) == 0) {
+    if ((frameCount % 1000) == 0) {
         Serial.printf("[Capture] Matching frames=%lu EAPOL=%lu PMKID=%lu\n",
                       (unsigned long)frameCount,
                       (unsigned long)eapolCount,
@@ -560,6 +772,20 @@ void rxCallback(void* buf, wifi_promiscuous_pkt_type_t) {
 }  // namespace
 
 void setup() {
+    capturePreferences.begin("capturecfg", false);
+    nextSessionId = capturePreferences.getUInt("nextid", 1);
+    if (nextSessionId == 0) nextSessionId = 1;
+    savedChannel = capturePreferences.getUChar("channel", 1);
+    if (savedChannel < 1 || savedChannel > 14) savedChannel = 1;
+    savedFullChannel = capturePreferences.getBool("full", true);
+    resumeOnBoot = capturePreferences.getBool("resume", false);
+    String savedBssidString = capturePreferences.isKey("bssid")
+                                 ? capturePreferences.getString("bssid", "")
+                                 : String();
+    savedBssidString.toCharArray(savedBssidText, sizeof(savedBssidText));
+    savedConfigValid = capturePreferences.isKey("channel") &&
+                       (savedFullChannel || parseSavedBssid(savedBssidText, savedBssid));
+
     pmkidBuf.reserve(512);
     fsReady = LittleFS.begin(true);
     Serial.printf("[Capture] LittleFS %s\n", fsReady ? "ready" : "init failed");
@@ -571,6 +797,7 @@ void setup() {
                       latestPcapKnown ? "yes" : "no",
                       latestPmkidKnown ? "yes" : "no",
                       latestMetaKnown ? "yes" : "no");
+        logSavedFiles();
     }
 }
 
@@ -582,6 +809,11 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
         strncpy(lastError, "missing target bssid", sizeof(lastError) - 1);
         return;
     }
+
+    saveCaptureConfig(channel, bssid, fullChannel);
+    resumeOnBoot = true;
+    const bool resumeWritten = capturePreferences.putBool("resume", true) == sizeof(uint8_t);
+    Serial.printf("[Capture] Resume-on-boot state saved: %s\n", resumeWritten ? "running" : "FAILED");
 
     fullChannelMode = fullChannel;
     captureChannel = channel;
@@ -601,10 +833,12 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
     idleWarningShown = false;
     startMs = millis();
     lastDiagMs = startMs;
+    lastCheckpointMs = startMs;
     rawChannelFrames = 0;
     savedBeaconFrames = 0;
     savedProbeRespFrames = 0;
     pcapDroppedRecords = 0;
+    pmkidCheckpointPending = false;
     pcapActivePos = 0;
     pcapFlushLen = 0;
     pcapFlushPending = false;
@@ -629,11 +863,23 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
 
     pcapWritePos = sizeof(PCAP_GHDR);
     latestPcapKnown = false;
+    latestPmkidKnown = preserveSavedFilesOnStart ? latestPmkidKnown : false;
+    latestMetaKnown = preserveSavedFilesOnStart ? latestMetaKnown : false;
     if (fsReady) {
+        archiveExistingSession();
+        latestPcapKnown = false;
+        latestPmkidKnown = false;
+        latestMetaKnown = false;
         if (fileExistsNoisySafe(kLatestPcapPath)) {
             LittleFS.remove(kLatestPcapPath);
         }
-        pcapFile = LittleFS.open(kLatestPcapPath, FILE_WRITE);
+        if (!preserveSavedFilesOnStart && fileExistsNoisySafe(kLatestPmkidPath)) {
+            LittleFS.remove(kLatestPmkidPath);
+        }
+        if (!preserveSavedFilesOnStart && fileExistsNoisySafe(kLatestMetaPath)) {
+            LittleFS.remove(kLatestMetaPath);
+        }
+        pcapFile = LittleFS.open(kLatestPcapPath, FILE_WRITE, true);
         if (pcapFile) {
             pcapFileOpen = true;
             pcapFile.write(PCAP_GHDR, sizeof(PCAP_GHDR));
@@ -641,6 +887,8 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
             strncpy(lastError, "pcap file open failed", sizeof(lastError) - 1);
         }
     }
+    lastCheckpointPcapPos = pcapWritePos;
+    lastCheckpointPmkidCount = pmkidCount;
     isRunning = true;
 
     char bssidStr[18];
@@ -652,8 +900,56 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
     Serial.println("[Capture] Waiting for matching traffic...");
 }
 
+void saveConfiguration(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
+    if (channel < 1 || channel > 14) return;
+    if (!fullChannel && !bssid) return;
+    saveCaptureConfig(channel, bssid, fullChannel);
+}
+
+void startSaved(bool preserveSavedFiles) {
+    preserveSavedFilesOnStart = preserveSavedFiles;
+    if (!savedConfigValid) {
+        start(1, nullptr, true);
+    } else if (savedFullChannel) {
+        start(savedChannel, nullptr, true);
+    } else {
+        start(savedChannel, savedBssid, false);
+    }
+    preserveSavedFilesOnStart = false;
+}
+
+bool hasSavedConfig() {
+    return savedConfigValid;
+}
+
+bool isAutoStartEnabled() {
+    return resumeOnBoot;
+}
+
+void setAutoStartEnabled(bool enabled) {
+    // Kept for API compatibility; boot behavior is now based on the last
+    // actual capture state rather than a web UI preference.
+    resumeOnBoot = enabled;
+    capturePreferences.putBool("resume", enabled);
+}
+
+uint8_t getSavedChannel() {
+    return savedChannel;
+}
+
+bool usesSavedFullChannel() {
+    return savedFullChannel;
+}
+
+const char* getSavedBssid() {
+    return savedBssidText;
+}
+
 void stop() {
     if (isRunning) {
+        resumeOnBoot = false;
+        const bool resumeWritten = capturePreferences.putBool("resume", false) == sizeof(uint8_t);
+        Serial.printf("[Capture] Resume-on-boot state saved: %s\n", resumeWritten ? "idle" : "FAILED");
         esp_wifi_set_promiscuous_rx_cb(nullptr);
         esp_wifi_set_promiscuous(false);
         esp_wifi_stop();
@@ -675,7 +971,7 @@ void stop() {
             if (fileExistsNoisySafe(kLatestPmkidPath)) {
                 LittleFS.remove(kLatestPmkidPath);
             }
-            File pmkidFile = LittleFS.open(kLatestPmkidPath, FILE_WRITE);
+            File pmkidFile = LittleFS.open(kLatestPmkidPath, FILE_WRITE, true);
             bool pmkidSaved = false;
             if (pmkidFile) {
                 pmkidSaved = (pmkidFile.write((const uint8_t*)pmkidData, pmkidSize) == pmkidSize);
@@ -687,7 +983,7 @@ void stop() {
             if (fileExistsNoisySafe(kLatestMetaPath)) {
                 LittleFS.remove(kLatestMetaPath);
             }
-            File metaFile = LittleFS.open(kLatestMetaPath, FILE_WRITE);
+            File metaFile = LittleFS.open(kLatestMetaPath, FILE_WRITE, true);
             bool metaSaved = false;
             if (metaFile) {
                 metaSaved = (metaFile.print(meta) == meta.length());
@@ -713,6 +1009,14 @@ void loop() {
     flushPendingPcapChunk();
 
     uint32_t now = millis();
+    const bool newPcapData = pcapWritePos != lastCheckpointPcapPos;
+    const bool newPmkidData = pmkidCount != lastCheckpointPmkidCount;
+    const bool checkpointDue = now - lastCheckpointMs >= CHECKPOINT_INTERVAL_MS;
+    const bool immediatePmkidCheckpoint = pmkidCheckpointPending && newPmkidData;
+    if ((checkpointDue || immediatePmkidCheckpoint) && (newPcapData || newPmkidData)) {
+        lastCheckpointMs = now;
+        checkpointCapture(newPcapData, newPmkidData);
+    }
     if (now - lastDiagMs >= 10000) {
         lastDiagMs = now;
         if (!firstFrameSeen && !idleWarningShown) {
@@ -765,7 +1069,7 @@ bool hasLatestMetadata() {
 
 size_t getLatestPcapSize() {
     if (!fsReady || !latestPcapKnown) return 0;
-    if (!LittleFS.exists(kLatestPcapPath)) {
+    if (!fileExistsNoisySafe(kLatestPcapPath)) {
         latestPcapKnown = false;
         return 0;
     }
@@ -778,7 +1082,7 @@ size_t getLatestPcapSize() {
 
 size_t getLatestPmkidSize() {
     if (!fsReady || !latestPmkidKnown) return 0;
-    if (!LittleFS.exists(kLatestPmkidPath)) {
+    if (!fileExistsNoisySafe(kLatestPmkidPath)) {
         latestPmkidKnown = false;
         return 0;
     }
@@ -791,7 +1095,7 @@ size_t getLatestPmkidSize() {
 
 size_t getLatestMetaSize() {
     if (!fsReady || !latestMetaKnown) return 0;
-    if (!LittleFS.exists(kLatestMetaPath)) {
+    if (!fileExistsNoisySafe(kLatestMetaPath)) {
         latestMetaKnown = false;
         return 0;
     }
@@ -800,6 +1104,20 @@ size_t getLatestMetaSize() {
     size_t sz = f.size();
     f.close();
     return sz;
+}
+
+size_t getFilesystemTotalBytes() {
+    return fsReady ? LittleFS.totalBytes() : 0;
+}
+
+size_t getFilesystemUsedBytes() {
+    return fsReady ? LittleFS.usedBytes() : 0;
+}
+
+size_t getFilesystemFreeBytes() {
+    const size_t total = getFilesystemTotalBytes();
+    const size_t used = getFilesystemUsedBytes();
+    return used < total ? total - used : 0;
 }
 
 const char* getLastError() {
@@ -841,7 +1159,7 @@ size_t getPmkidSize() {
 
 bool loadLatestPcap(std::vector<uint8_t>& out) {
     if (!fsReady || !latestPcapKnown) return false;
-    if (!LittleFS.exists(kLatestPcapPath)) {
+    if (!fileExistsNoisySafe(kLatestPcapPath)) {
         latestPcapKnown = false;
         return false;
     }
@@ -855,7 +1173,7 @@ bool loadLatestPcap(std::vector<uint8_t>& out) {
 
 bool loadLatestPmkid(String& out) {
     if (!fsReady || !latestPmkidKnown) return false;
-    if (!LittleFS.exists(kLatestPmkidPath)) {
+    if (!fileExistsNoisySafe(kLatestPmkidPath)) {
         latestPmkidKnown = false;
         return false;
     }
@@ -868,7 +1186,7 @@ bool loadLatestPmkid(String& out) {
 
 bool loadLatestMeta(String& out) {
     if (!fsReady || !latestMetaKnown) return false;
-    if (!LittleFS.exists(kLatestMetaPath)) {
+    if (!fileExistsNoisySafe(kLatestMetaPath)) {
         latestMetaKnown = false;
         return false;
     }
@@ -882,9 +1200,21 @@ bool loadLatestMeta(String& out) {
 bool clearLatestSaved() {
     if (!fsReady) return false;
     bool ok = true;
-    if (LittleFS.exists(kLatestPcapPath)) ok = LittleFS.remove(kLatestPcapPath) && ok;
-    if (LittleFS.exists(kLatestPmkidPath)) ok = LittleFS.remove(kLatestPmkidPath) && ok;
-    if (LittleFS.exists(kLatestMetaPath)) ok = LittleFS.remove(kLatestMetaPath) && ok;
+    if (fileExistsNoisySafe(kLatestPcapPath)) ok = LittleFS.remove(kLatestPcapPath) && ok;
+    if (fileExistsNoisySafe(kLatestPmkidPath)) ok = LittleFS.remove(kLatestPmkidPath) && ok;
+    if (fileExistsNoisySafe(kLatestMetaPath)) ok = LittleFS.remove(kLatestMetaPath) && ok;
+
+    File root = LittleFS.open("/");
+    if (root) {
+        File file = root.openNextFile();
+        while (file) {
+            String name = file.name();
+            file.close();
+            if (name.startsWith("/session_")) ok = LittleFS.remove(name) && ok;
+            file = root.openNextFile();
+        }
+        root.close();
+    }
     latestPcapKnown = false;
     latestPmkidKnown = false;
     latestMetaKnown = false;

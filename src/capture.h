@@ -21,6 +21,14 @@ void start(uint8_t channel, const uint8_t* targetBSSID, bool fullChannel = false
 void stop();
 void loop();
 void reset();
+void startSaved(bool preserveSavedFiles = true);
+void saveConfiguration(uint8_t channel, const uint8_t* targetBSSID, bool fullChannel);
+bool hasSavedConfig();
+bool isAutoStartEnabled();
+void setAutoStartEnabled(bool enabled);
+uint8_t getSavedChannel();
+bool usesSavedFullChannel();
+const char* getSavedBssid();
 
 bool usesFullChannel();
 bool managementApActive();
@@ -33,6 +41,9 @@ bool        hasLatestMetadata();
 size_t      getLatestPcapSize();
 size_t      getLatestPmkidSize();
 size_t      getLatestMetaSize();
+size_t      getFilesystemTotalBytes();
+size_t      getFilesystemUsedBytes();
+size_t      getFilesystemFreeBytes();
 
 const uint8_t* getPcapData();
 size_t         getPcapSize();

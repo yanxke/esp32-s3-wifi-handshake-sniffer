@@ -61,9 +61,9 @@ std::vector<APInfo> scanNetworks() {
             info.ssid = "<hidden>";
         }
 
-        Serial.printf("  [%d] %s (%s) Ch:%d RSSI:%d\n",
+        Serial.printf("[Scanner] AP[%d] SSID=\"%s\" BSSID=%s channel=%d RSSI=%d security=%d\n",
                       i, info.ssid.c_str(), info.bssid.c_str(),
-                      info.channel, info.rssi);
+                      info.channel, info.rssi, info.encryption);
 
         results.push_back(info);
     }
