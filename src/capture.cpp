@@ -901,9 +901,10 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* 
 
     char bssidStr[18];
     macStr(targetBssid, bssidStr);
-    Serial.printf("[Capture] Passive sniff start Ch=%u mode=%s target=%s\n",
+    Serial.printf("[Capture] Passive sniff start Ch=%u mode=%s target=%s essid=\"%s\"\n",
                   captureChannel, fullChannelMode ? "full" : "target",
-                  fullChannelMode ? "<all>" : bssidStr);
+                  fullChannelMode ? "<all>" : bssidStr,
+                  captureEssid.length() ? captureEssid.c_str() : "<empty>");
     Serial.println("[Capture] WiFi mode=STA promiscuous");
     Serial.println("[Capture] Waiting for matching traffic...");
 }
@@ -1229,7 +1230,7 @@ bool clearLatestSaved() {
         while (file) {
             String name = file.name();
             file.close();
-            if (name.startsWith("/session_")) ok = LittleFS.remove(name) && ok;
+            if (name.startsWith("/session_")) ok = LittleFS.remove(name.c_str()) && ok;
             file = root.openNextFile();
         }
         root.close();
@@ -1237,6 +1238,38 @@ bool clearLatestSaved() {
     latestPcapKnown = false;
     latestPmkidKnown = false;
     latestMetaKnown = false;
+    return ok;
+}
+
+bool clearAllFiles() {
+    if (!fsReady || isRunning) return false;
+
+    std::vector<String> names;
+    File root = LittleFS.open("/");
+    if (!root) return false;
+
+    File file = root.openNextFile();
+    while (file) {
+        if (!file.isDirectory()) {
+            String name = file.name();
+            if (!name.startsWith("/")) name = "/" + name;
+            names.push_back(name);
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+
+    bool ok = true;
+    for (const String& name : names) {
+        ok = LittleFS.remove(name.c_str()) && ok;
+    }
+
+    latestPcapKnown = false;
+    latestPmkidKnown = false;
+    latestMetaKnown = false;
+    Serial.printf("[Capture] LittleFS delete all files: %u file(s), %s\n",
+                  (unsigned)names.size(), ok ? "ok" : "FAIL");
     return ok;
 }
 

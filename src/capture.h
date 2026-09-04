@@ -53,5 +53,6 @@ bool           loadLatestPcap(std::vector<uint8_t>& out);
 bool           loadLatestPmkid(String& out);
 bool           loadLatestMeta(String& out);
 bool           clearLatestSaved();
+bool           clearAllFiles();
 
 }  // namespace Capture
