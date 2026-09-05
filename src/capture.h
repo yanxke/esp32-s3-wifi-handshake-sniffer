@@ -49,6 +49,7 @@ const uint8_t* getPcapData();
 size_t         getPcapSize();
 const char*    getPmkidData();
 size_t         getPmkidSize();
+bool           has22000Data();
 bool           loadLatestPcap(std::vector<uint8_t>& out);
 bool           loadLatestPmkid(String& out);
 bool           loadLatestMeta(String& out);

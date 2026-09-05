@@ -32,6 +32,8 @@ constexpr const char* kLatestPmkidPath = "/latest_capture.22000";
 constexpr const char* kLatestMetaPath = "/latest_capture.json";
 constexpr size_t PCAP_CHUNK = 8 * 1024;
 constexpr size_t MAX_PMKID = 10;
+constexpr size_t MAX_NETWORKS = 8;
+constexpr size_t MAX_ESSID_LEN = 32;
 constexpr uint32_t CHECKPOINT_INTERVAL_MS = 60000;
 
 bool     fullChannelMode  = false;
@@ -79,9 +81,27 @@ String captureEssid;
 std::array<std::array<uint8_t, 16>, MAX_PMKID> pmkidList;
 std::array<std::array<uint8_t, 6>, MAX_PMKID>  pmkidApList;
 std::array<std::array<uint8_t, 6>, MAX_PMKID>  pmkidStaList;
+std::array<std::array<uint8_t, MAX_ESSID_LEN>, MAX_PMKID> pmkidEssidList;
+std::array<uint8_t, MAX_PMKID> pmkidEssidLen;
 int pmkidStored = 0;
 
 String buildSessionMetaJson(uint32_t elapsedSec);
+
+struct EapolCandidate {
+    bool valid = false;
+    uint64_t replay = 0;
+    uint8_t mic[16] = {0};
+    uint16_t len = 0;
+    uint8_t nonce[32] = {0};
+    uint8_t data[256] = {0};
+};
+
+struct NetworkEssid {
+    bool used = false;
+    uint8_t bssid[6] = {0};
+    uint8_t len = 0;
+    uint8_t data[MAX_ESSID_LEN] = {0};
+};
 
 struct HandshakeState {
     uint8_t ap[6] = {0};
@@ -93,9 +113,28 @@ struct HandshakeState {
     bool m4 = false;
     uint64_t lastReplay = 0;
     uint8_t lastLoggedMsg = 0;
+    uint8_t anonce[32] = {0};
+    uint64_t m1Replay = 0;
+    uint8_t essidLen = 0;
+    uint8_t essid[MAX_ESSID_LEN] = {0};
+    EapolCandidate m2Data;
+    EapolCandidate m3Data;
+    EapolCandidate m4Data;
 };
 
 std::array<HandshakeState, 8> handshakes;
+std::array<NetworkEssid, MAX_NETWORKS> networkEssids;
+
+void storeEapolCandidate(EapolCandidate& candidate, const uint8_t* pkt, int off,
+                         uint16_t frameLen, uint64_t replay) {
+    candidate.valid = true;
+    candidate.replay = replay;
+    candidate.len = frameLen;
+    memcpy(candidate.nonce, pkt + off + 17, sizeof(candidate.nonce));
+    memcpy(candidate.data, pkt + off, frameLen);
+    memcpy(candidate.mic, pkt + off + 81, sizeof(candidate.mic));
+    memset(candidate.data + 81, 0, sizeof(candidate.mic));
+}
 
 const uint8_t PCAP_GHDR[] = {
     0xD4, 0xC3, 0xB2, 0xA1, 0x02, 0x00, 0x04, 0x00,
@@ -154,6 +193,54 @@ bool sameMac(const uint8_t* a, const uint8_t* b) {
     return memcmp(a, b, 6) == 0;
 }
 
+NetworkEssid* getNetworkEssid(const uint8_t* bssid, bool create) {
+    for (auto& network : networkEssids) {
+        if (network.used && sameMac(network.bssid, bssid)) return &network;
+    }
+    if (!create) return nullptr;
+    for (auto& network : networkEssids) {
+        if (!network.used) {
+            network.used = true;
+            memcpy(network.bssid, bssid, 6);
+            return &network;
+        }
+    }
+    return nullptr;
+}
+
+bool extractSsidFromManagement(const uint8_t* pkt, uint16_t len,
+                               uint8_t* ssid, uint8_t* ssidLen) {
+    if (!pkt || !ssid || !ssidLen || len < 36) return false;
+
+    const uint8_t subtype = (pkt[0] >> 4) & 0x0F;
+    if (subtype != 0x08 && subtype != 0x05) return false;
+
+    int pos = 36; // 24-byte MAC header + 12-byte beacon/probe fixed fields
+    while (pos + 2 <= len) {
+        const uint8_t id = pkt[pos];
+        const uint8_t ieLen = pkt[pos + 1];
+        pos += 2;
+        if (pos + ieLen > len) return false;
+        if (id == 0) {
+            if (ieLen == 0 || ieLen > MAX_ESSID_LEN) return false;
+            memcpy(ssid, pkt + pos, ieLen);
+            *ssidLen = ieLen;
+            return true;
+        }
+        pos += ieLen;
+    }
+    return false;
+}
+
+void rememberNetworkEssid(const uint8_t* bssid, const uint8_t* ssid, uint8_t ssidLen) {
+    if (!bssid || !ssid || ssidLen == 0 || ssidLen > MAX_ESSID_LEN) return;
+    NetworkEssid* network = getNetworkEssid(bssid, true);
+    if (!network) return;
+    memcpy(network->bssid, bssid, 6);
+    memcpy(network->data, ssid, ssidLen);
+    network->len = ssidLen;
+}
+
 bool matchesTarget(const uint8_t* pkt, uint16_t len) {
     if (fullChannelMode) return true;
     if (len < 24) return false;
@@ -207,6 +294,14 @@ void macStr(const uint8_t* m, char* out) {
     snprintf(out, 18, "%02X%02X%02X%02X%02X%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
 }
 
+void appendHex(String& out, const uint8_t* data, size_t len) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < len; ++i) {
+        out += hex[data[i] >> 4];
+        out += hex[data[i] & 0x0F];
+    }
+}
+
 bool isPmkidDuplicate(const uint8_t* pmkid) {
     for (int i = 0; i < pmkidStored; ++i) {
         if (memcmp(pmkidList[i].data(), pmkid, 16) == 0) return true;
@@ -214,13 +309,18 @@ bool isPmkidDuplicate(const uint8_t* pmkid) {
     return false;
 }
 
-void addPmkid(const uint8_t* pmkid, const uint8_t* ap, const uint8_t* sta) {
+void addPmkid(const uint8_t* pmkid, const uint8_t* ap, const uint8_t* sta,
+              const uint8_t* essid, uint8_t essidLen) {
     if (pmkidStored >= (int)MAX_PMKID || isPmkidDuplicate(pmkid)) return;
     memcpy(pmkidList[pmkidStored].data(), pmkid, 16);
     if (ap) memcpy(pmkidApList[pmkidStored].data(), ap, 6);
     else memset(pmkidApList[pmkidStored].data(), 0xFF, 6);
     if (sta) memcpy(pmkidStaList[pmkidStored].data(), sta, 6);
     else memset(pmkidStaList[pmkidStored].data(), 0xFF, 6);
+    pmkidEssidLen[pmkidStored] = (essid && essidLen <= MAX_ESSID_LEN) ? essidLen : 0;
+    if (pmkidEssidLen[pmkidStored] > 0) {
+        memcpy(pmkidEssidList[pmkidStored].data(), essid, pmkidEssidLen[pmkidStored]);
+    }
     pmkidStored++;
     pmkidCount = pmkidStored;
     pmkidFound = true;
@@ -232,20 +332,24 @@ void addPmkid(const uint8_t* pmkid, const uint8_t* ap, const uint8_t* sta) {
                   (unsigned)pmkidCount, apStr, staStr);
 }
 
-void extractPmkidFromM1(const uint8_t* pkt, uint16_t len, int off, const uint8_t* sta, const uint8_t* ap) {
-    int kdStart = off + 95;
-    if (kdStart + 6 > len) return;
-    int searchEnd = len - 22;
+void extractPmkidFromM1(const uint8_t* pkt, uint16_t len, int off, const uint8_t* sta,
+                        const uint8_t* ap, const uint8_t* essid, uint8_t essidLen) {
+    if (off < 0 || off + 99 > len) return;
+    const uint16_t keyDataLen = (uint16_t(pkt[off + 97]) << 8) | pkt[off + 98];
+    const int kdStart = off + 99;
+    const int searchEnd = kdStart + keyDataLen - 22;
+    if (keyDataLen < 22 || searchEnd >= len) return;
     for (int i = kdStart; i <= searchEnd; ++i) {
         if (pkt[i] == 0xDD && pkt[i + 2] == 0x00 && pkt[i + 3] == 0x0F &&
             pkt[i + 4] == 0xAC && pkt[i + 5] == 0x04) {
-            addPmkid(pkt + i + 6, ap, sta);
+            addPmkid(pkt + i + 6, ap, sta, essid, essidLen);
             return;
         }
     }
 }
 
-void extractPmkidFromBeacon(const uint8_t* pkt, uint16_t len, const uint8_t* bssid) {
+void extractPmkidFromBeacon(const uint8_t* pkt, uint16_t len, const uint8_t* bssid,
+                            const uint8_t* essid, uint8_t essidLen) {
     for (int i = 24; i < len - 20; ++i) {
         if (pkt[i] == 0x30 && pkt[i + 2] == 0x00 && pkt[i + 3] == 0x0F && pkt[i + 4] == 0xAC) {
             int rsnLen = pkt[i + 1];
@@ -261,7 +365,7 @@ void extractPmkidFromBeacon(const uint8_t* pkt, uint16_t len, const uint8_t* bss
             uint16_t pmkidCnt = pkt[pos] | (pkt[pos + 1] << 8);
             pos += 2;
             for (int j = 0; j < pmkidCnt && pos + 16 <= i + 2 + rsnLen; ++j) {
-                addPmkid(pkt + pos, bssid, nullptr);
+                addPmkid(pkt + pos, bssid, nullptr, essid, essidLen);
                 pos += 16;
             }
             return;
@@ -356,10 +460,14 @@ size_t fileSizeNoisySafe(const char* path) {
 }
 
 void analyzeKey(const uint8_t* pkt, uint16_t len, int off) {
-    if (off < 0 || off + 17 > len) return;
+    if (off < 0 || off + 99 > len) return;
     if (pkt[off + 1] != 0x03) return;
 
-    uint16_t ki = pkt[off + 6] | (pkt[off + 7] << 8);
+    const uint16_t bodyLen = (uint16_t(pkt[off + 2]) << 8) | pkt[off + 3];
+    const uint16_t frameLen = uint16_t(bodyLen + 4);
+    if (frameLen < 99 || frameLen > 256 || off + frameLen > len) return;
+
+    const uint16_t ki = (uint16_t(pkt[off + 5]) << 8) | pkt[off + 6];
     const bool pairwise = ((ki >> 3) & 1) != 0;
     if (!pairwise) return;
 
@@ -368,9 +476,12 @@ void analyzeKey(const uint8_t* pkt, uint16_t len, int off) {
     uint8_t sa[6], da[6];
     getAddrs(pkt, sa, da);
 
-    const bool mic = ((ki >> 6) & 1) != 0;
+    const bool mic = ((ki >> 8) & 1) != 0;
     const bool ack = ((ki >> 7) & 1) != 0;
-    const bool inst = ((ki >> 4) & 1) != 0;
+    // WPA Key Information: Install is bit 6 (Key Index occupies bits 4-5).
+    // Bit 4 is not the Install flag and causes M3 (for example, 0x13CA) to
+    // be missed entirely.
+    const bool inst = ((ki >> 6) & 1) != 0;
     const bool sec = ((ki >> 9) & 1) != 0;
     uint64_t replay = 0;
     for (int i = 0; i < 8; ++i) {
@@ -387,19 +498,34 @@ void analyzeKey(const uint8_t* pkt, uint16_t len, int off) {
     }
 
     HandshakeState* hs = getHandshakeState(ap, sta);
+    NetworkEssid* network = getNetworkEssid(ap, false);
+    if (network && network->len > 0) {
+        hs->essidLen = network->len;
+        memcpy(hs->essid, network->data, network->len);
+    }
+    const uint8_t* hsEssid = hs->essidLen > 0
+                               ? hs->essid
+                               : (const uint8_t*)captureEssid.c_str();
+    const uint8_t hsEssidLen = hs->essidLen > 0
+                                 ? hs->essidLen
+                                 : uint8_t(captureEssid.length() > MAX_ESSID_LEN
+                                             ? MAX_ESSID_LEN : captureEssid.length());
     uint8_t msgType = 0;
 
     if (ack && !mic && !inst && !sec && !hs->m1) {
         hs->m1 = true;
+        hs->m1Replay = replay;
+        memcpy(hs->anonce, pkt + off + 17, sizeof(hs->anonce));
         msgType = 1;
         char apStr[18], staStr[18];
         macStr(ap, apStr);
         macStr(sta, staStr);
         Serial.printf("[Capture] EAPOL M1 AP=%s STA=%s ki=0x%04X replay=%llu\n",
                       apStr, staStr, ki, replay);
-        extractPmkidFromM1(pkt, len, off, sta, ap);
+        extractPmkidFromM1(pkt, len, off, sta, ap, hsEssid, hsEssidLen);
     } else if (!ack && mic && !inst && !sec && !hs->m2) {
         hs->m2 = true;
+        storeEapolCandidate(hs->m2Data, pkt, off, frameLen, replay);
         msgType = 2;
         char apStr[18], staStr[18];
         macStr(ap, apStr);
@@ -408,6 +534,7 @@ void analyzeKey(const uint8_t* pkt, uint16_t len, int off) {
                       apStr, staStr, ki, replay);
     } else if (ack && mic && inst && sec && !hs->m3) {
         hs->m3 = true;
+        storeEapolCandidate(hs->m3Data, pkt, off, frameLen, replay);
         msgType = 3;
         char apStr[18], staStr[18];
         macStr(ap, apStr);
@@ -416,6 +543,7 @@ void analyzeKey(const uint8_t* pkt, uint16_t len, int off) {
                       apStr, staStr, ki, replay);
     } else if (!ack && mic && !inst && sec && !hs->m4) {
         hs->m4 = true;
+        storeEapolCandidate(hs->m4Data, pkt, off, frameLen, replay);
         msgType = 4;
         char apStr[18], staStr[18];
         macStr(ap, apStr);
@@ -762,7 +890,13 @@ void rxCallback(void* buf, wifi_promiscuous_pkt_type_t) {
         if (subtype == 0x08 || subtype == 0x05) {
             uint8_t bssid[6];
             memcpy(bssid, payload + 16, 6);
-            extractPmkidFromBeacon(payload, len, bssid);
+            uint8_t ssid[MAX_ESSID_LEN];
+            uint8_t ssidLen = 0;
+            const bool hasSsid = extractSsidFromManagement(payload, len, ssid, &ssidLen);
+            if (hasSsid) rememberNetworkEssid(bssid, ssid, ssidLen);
+            extractPmkidFromBeacon(payload, len, bssid,
+                                   hasSsid ? ssid : nullptr,
+                                   hasSsid ? ssidLen : 0);
         }
     }
 
@@ -834,6 +968,7 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* 
     handshakeFound = false;
     pmkidFound = false;
     pmkidStored = 0;
+    for (auto& network : networkEssids) network = NetworkEssid{};
     capSummary[0] = '\0';
     pmkidBuf = "";
     resetHandshakeState();
@@ -1115,6 +1250,58 @@ size_t getLatestMetaSize() {
     return sz;
 }
 
+constexpr uint64_t MAX_REPLAY_GAP = 8;
+
+bool replayPairAcceptable(uint64_t a, uint64_t b) {
+    const uint64_t gap = a >= b ? a - b : b - a;
+    return gap <= MAX_REPLAY_GAP;
+}
+
+uint8_t replayPairMarker(uint8_t base, uint64_t a, uint64_t b) {
+    return replayPairAcceptable(a, b) && a == b ? base : uint8_t(base | 0x80);
+}
+
+bool eapolPairAvailable(const EapolCandidate& candidate, uint64_t referenceReplay) {
+    return candidate.valid && candidate.len > 0 &&
+           replayPairAcceptable(referenceReplay, candidate.replay);
+}
+
+void appendEapolRecord(String& out, const HandshakeState& hs,
+                       const EapolCandidate& candidate, const uint8_t* anonce,
+                       uint64_t referenceReplay, uint8_t pairType) {
+    if (!eapolPairAvailable(candidate, referenceReplay)) return;
+
+    out += "WPA*02*";
+    appendHex(out, candidate.mic, sizeof(candidate.mic));
+    out += "*";
+    char mac[18];
+    macStr(hs.ap, mac);
+    out += mac;
+    out += "*";
+    macStr(hs.sta, mac);
+    out += mac;
+    out += "*";
+    const uint8_t* essid = hs.essidLen > 0
+                             ? hs.essid
+                             : (const uint8_t*)captureEssid.c_str();
+    const size_t essidLen = hs.essidLen > 0
+                              ? hs.essidLen
+                              : (captureEssid.length() > MAX_ESSID_LEN
+                                  ? MAX_ESSID_LEN : captureEssid.length());
+    appendHex(out, essid, essidLen);
+    out += "*";
+    appendHex(out, anonce, 32);
+    out += "*";
+    appendHex(out, candidate.data, candidate.len);
+    out += "*";
+    // The message-pair field is a byte and must always be two hex digits.
+    const uint8_t marker = replayPairMarker(pairType, referenceReplay, candidate.replay);
+    static const char hex[] = "0123456789ABCDEF";
+    out += hex[marker >> 4];
+    out += hex[marker & 0x0F];
+    out += "\n";
+}
+
 size_t getFilesystemTotalBytes() {
     return fsReady ? LittleFS.totalBytes() : 0;
 }
@@ -1151,9 +1338,15 @@ const char* getPmkidData() {
         for (int j = 0; j < 16; ++j) {
             snprintf(pmkidHex + j * 2, 3, "%02X", pmkidList[i][j]);
         }
-        const size_t essidLen = captureEssid.length() > 32 ? 32 : captureEssid.length();
+        const uint8_t* recordEssid = pmkidEssidLen[i] > 0
+                                       ? pmkidEssidList[i].data()
+                                       : (const uint8_t*)captureEssid.c_str();
+        const size_t essidLen = pmkidEssidLen[i] > 0
+                                  ? pmkidEssidLen[i]
+                                  : (captureEssid.length() > MAX_ESSID_LEN
+                                      ? MAX_ESSID_LEN : captureEssid.length());
         for (size_t j = 0; j < essidLen; ++j) {
-            snprintf(essidHex + j * 2, 3, "%02X", (uint8_t)captureEssid[j]);
+            snprintf(essidHex + j * 2, 3, "%02X", recordEssid[j]);
         }
         essidHex[essidLen * 2] = '\0';
         // PMKID records use signature 01 in hashcat's WPA 22000 format.
@@ -1170,11 +1363,43 @@ const char* getPmkidData() {
         pmkidBuf += essidHex;
         pmkidBuf += "***\n";
     }
+
+    // Export bounded, replay-checked EAPOL pair candidates. The MIC is
+    // preserved in field 2 and zeroed in the EAPOL field.
+    for (const auto& hs : handshakes) {
+        if (!hs.used || !hs.m1) continue;
+        if (hs.m3Data.valid) {
+            // Match hcxtools' preferred pairing: use the AP's M3 nonce with
+            // the client M2 EAPOL. A replay mismatch is represented by the
+            // high bit, producing the usual M32E2/0x82 form when needed.
+            appendEapolRecord(pmkidBuf, hs, hs.m2Data, hs.m3Data.nonce, hs.m3Data.replay, 2);
+        }
+        appendEapolRecord(pmkidBuf, hs, hs.m2Data, hs.anonce, hs.m1Replay, 0);
+        appendEapolRecord(pmkidBuf, hs, hs.m4Data, hs.anonce, hs.m1Replay, 1);
+        if (hs.m3Data.valid) {
+            appendEapolRecord(pmkidBuf, hs, hs.m3Data, hs.m3Data.nonce, hs.m3Data.replay, 3);
+            appendEapolRecord(pmkidBuf, hs, hs.m4Data, hs.m3Data.nonce, hs.m3Data.replay, 5);
+        }
+    }
     return pmkidBuf.c_str();
 }
 
 size_t getPmkidSize() {
     return strlen(getPmkidData());
+}
+
+bool has22000Data() {
+    if (pmkidStored > 0) return true;
+
+    for (const auto& hs : handshakes) {
+        if (!hs.used || !hs.m1) continue;
+        if (hs.m3Data.valid && eapolPairAvailable(hs.m2Data, hs.m3Data.replay)) return true;
+        if (eapolPairAvailable(hs.m2Data, hs.m1Replay)) return true;
+        if (eapolPairAvailable(hs.m4Data, hs.m1Replay)) return true;
+        if (hs.m3Data.valid && eapolPairAvailable(hs.m3Data, hs.m3Data.replay)) return true;
+        if (hs.m3Data.valid && eapolPairAvailable(hs.m4Data, hs.m3Data.replay)) return true;
+    }
+    return false;
 }
 
 bool loadLatestPcap(std::vector<uint8_t>& out) {

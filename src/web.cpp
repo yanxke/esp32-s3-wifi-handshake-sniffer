@@ -163,10 +163,6 @@ th{color:var(--muted);font-size:.76rem;text-transform:uppercase}
         <input id="capBssid" maxlength="17" placeholder="AA:BB:CC:DD:EE:FF" onchange="saveCaptureConfig()">
       </div>
       <div class="col">
-        <label id="ssidLabel">SSID</label>
-        <input id="capSsid" readonly placeholder="从扫描列表选择 AP">
-      </div>
-      <div class="col">
         <label id="channelLabel">监听信道</label>
         <input id="capChannel" type="number" min="1" max="14" value="1" onchange="saveCaptureConfig()">
       </div>
@@ -237,14 +233,13 @@ const text={
   zh:{intro:'仅用于被动监听握手包 / PMKID。启动抓包后，管理热点会暂时断开，停止后恢复。',scanTitle:'WiFi 扫描',scanBtn:'扫描附近 AP',channelHead:'信道',encryptionHead:'加密',scanEmpty:'点击扫描加载周边网络',captureTitle:'被动抓包',captureTip:'建议先选择目标 AP，再固定目标信道监听。全信道模式会保存更多包，但噪声更高。',modeLabel:'抓取模式',targetMode:'目标 BSSID 过滤',fullMode:'整信道监听',bssidLabel:'目标 BSSID',channelLabel:'监听信道',startBtn:'开始监听',stopBtn:'停止监听',pcapBtn:'下载 .pcap',pmkidBtn:'下载 .22000',captureHint:'抓包开始后 Web 页面可能短暂断开；停止监听后重新连接 `esp32-s3-whs` 即可。',latestHint:'最近一次抓包会在停止监听后自动保存到设备 Flash。',statusTitle:'抓取状态',statusLabel:'状态',targetFramesLabel:'目标帧',rawFramesLabel:'信道原始帧',summaryLabel:'摘要',savedTitle:'已保存抓包',savedTip:'只有在停止监听后，当前会话才会保存到设备 Flash。这里显示的是最近一次已保存结果。',reportLabel:'报告',savedStateLabel:'保存状态',storageLabel:'LittleFS 可用空间',filesTitle:'所有已保存会话',filesEmpty:'暂无已保存文件',savedPcapBtn:'下载已保存 .pcap',savedPmkidBtn:'下载已保存 .22000',savedMetaBtn:'下载报告 .json',clearSavedBtn:'清除已保存',autoStartLabel:'启动时自动开始上次配置',countdownTitle:'即将进入监听模式',countdownText:'管理热点会暂时关闭，当前网页连接将中断。停止监听后，重新连接 <strong>esp32-s3-whs</strong> 查看结果。',cancelBtn:'取消'},
   en:{intro:'For authorized passive handshake / PMKID monitoring only. The management AP disconnects during capture and returns afterward.',scanTitle:'WiFi scan',scanBtn:'Scan nearby APs',channelHead:'Channel',encryptionHead:'Security',scanEmpty:'Click scan to load nearby networks',captureTitle:'Passive capture',captureTip:'Select a target AP and listen on its channel. Full-channel mode saves more frames but includes more noise.',modeLabel:'Capture mode',targetMode:'Target BSSID filter',fullMode:'Full-channel listen',bssidLabel:'Target BSSID',channelLabel:'Listen channel',startBtn:'Start listening',stopBtn:'Stop listening',pcapBtn:'Download .pcap',pmkidBtn:'Download .22000',captureHint:'The Web page may disconnect during capture; reconnect to `esp32-s3-whs` after stopping.',latestHint:'The latest capture will be saved to device flash after listening stops.',statusTitle:'Capture status',statusLabel:'Status',targetFramesLabel:'Target frames',rawFramesLabel:'Raw channel frames',summaryLabel:'Summary',savedTitle:'Saved captures',savedTip:'The current session is saved to device flash only after listening stops. The latest saved result is shown here.',reportLabel:'Report',savedStateLabel:'Save status',storageLabel:'LittleFS free space',filesTitle:'All saved sessions',filesEmpty:'No saved files',savedPcapBtn:'Download saved .pcap',savedPmkidBtn:'Download saved .22000',savedMetaBtn:'Download report .json',clearSavedBtn:'Clear saved',autoStartLabel:'Start the saved configuration at boot',countdownTitle:'Entering listening mode',countdownText:'The management AP will close temporarily and this page will disconnect. Reconnect to <strong>esp32-s3-whs</strong> after stopping to view results.',cancelBtn:'Cancel'}
 };
-function applyLanguage(){const d=text[english?'en':'zh'];Object.keys(d).forEach(id=>{const e=$(id);if(e)e.innerHTML=d[id]});$('page').lang=english?'en':'zh-CN';$('languageToggle').textContent=english?'中文':'English';$('apState').textContent=english?'Management AP online':'管理热点在线';$('capStatus').textContent=english?'Idle':'空闲';$('savedState').textContent=english?'None':'无';$('clearAllFilesBtn').textContent=english?'Delete all LittleFS files':'删除 LittleFS 全部文件';$('capSsid').placeholder=english?'Select an AP from the scan list':'从扫描列表选择 AP'}
+function applyLanguage(){const d=text[english?'en':'zh'];Object.keys(d).forEach(id=>{const e=$(id);if(e)e.innerHTML=d[id]});$('page').lang=english?'en':'zh-CN';$('languageToggle').textContent=english?'中文':'English';$('apState').textContent=english?'Management AP online':'管理热点在线';$('capStatus').textContent=english?'Idle':'空闲';$('savedState').textContent=english?'None':'无';$('clearAllFilesBtn').textContent=english?'Delete all LittleFS files':'删除 LittleFS 全部文件'}
 async function loadPreferences(){try{const r=await fetch('/api/preferences');const d=await r.json();english=d.language==='en';applyLanguage()}catch(e){}}
 async function toggleLanguage(){english=!english;applyLanguage();try{await fetch('/api/preferences',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({language:english?'en':'zh'})})}catch(e){}}
 async function saveCaptureConfig(){
   const mode=$('capMode').value, bssid=$('capBssid').value.trim(), channel=parseInt($('capChannel').value,10)||1;
-  selectedSsid=$('capSsid').value;
   if(mode!=='full'&&!/^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/.test(bssid))return;
-  try{await fetch('/api/capture/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,bssid:bssid,channel:channel,ssid:selectedSsid})})}catch(e){}
+  try{await fetch('/api/capture/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode,bssid:bssid,channel:channel})})}catch(e){}
 }
 
 window.addEventListener('DOMContentLoaded',()=>{toggleMode();loadPreferences();loadSavedFiles();pollStatus();setInterval(pollStatus,2000);setInterval(loadSavedFiles,10000)})
@@ -261,7 +256,6 @@ async function scanNetworks(){
   $('scanBtn').disabled=false
 }
 
-var selectedSsid='';
 function renderTable(nets){
   const body=$('scanBody');
   if(!nets||!nets.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:20px">'+(english?'No APs found':'未发现 AP')+'</td></tr>';return}
@@ -273,7 +267,7 @@ function renderTable(nets){
     h+='<td>'+(n.rssi??'')+'</td>';
     h+='<td>'+(n.channel??'')+'</td>';
     h+='<td>'+esc(encMap(n.encryption))+'</td>';
-    h+='<td><button class="ghost" type="button" data-ssid="'+esc(n.ssid==='<hidden>'?'':(n.ssid||''))+'" data-bssid="'+esc(n.bssid||'')+'" data-channel="'+(n.channel||1)+'">'+(english?'Select':'选择')+'</button></td>';
+    h+='<td><button class="ghost" type="button" data-bssid="'+esc(n.bssid||'')+'" data-channel="'+(n.channel||1)+'">'+(english?'Select':'选择')+'</button></td>';
     h+='</tr>';
   });
   body.innerHTML=h
@@ -284,8 +278,6 @@ document.addEventListener('click',e=>{
   if(!btn)return;
   $('capBssid').value=btn.dataset.bssid||'';
   $('capChannel').value=btn.dataset.channel||'1';
-  selectedSsid=btn.dataset.ssid||'';
-  $('capSsid').value=selectedSsid;
   $('capMode').value='target';
   toggleMode();
   saveCaptureConfig();
@@ -295,9 +287,8 @@ async function captureStart(){
   const mode=$('capMode').value;
   const bssid=$('capBssid').value.trim();
   const channel=parseInt($('capChannel').value,10)||1;
-  selectedSsid=$('capSsid').value;
   if(mode!=='full'&&!bssid){alert(english?'Enter a target BSSID':'请输入目标 BSSID');return}
-  pendingCaptureBody={mode:mode,bssid:bssid,channel:channel,ssid:selectedSsid};
+  pendingCaptureBody={mode:mode,bssid:bssid,channel:channel};
   beginCountdown()
 }
 

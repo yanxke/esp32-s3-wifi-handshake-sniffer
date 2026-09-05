@@ -51,10 +51,11 @@ void updateStatusLed() {
     if (now - lastLedUpdateMs >= cycleMs / 2) {
         lastLedUpdateMs = now;
         ledOn = !ledOn;
-        const bool hasPmkid = Capture::pmkidCount > 0;
-        // PMKID data present: orange; otherwise captured packets: yellow.
-        const uint8_t red = hasPmkid ? 80 : 64;
-        const uint8_t green = hasPmkid ? 24 : 64;
+        const bool has22000 = Capture::has22000Data();
+        // Any usable WPA*01 or WPA*02 record: orange; otherwise captured
+        // handshake packets: yellow.
+        const uint8_t red = has22000 ? 80 : 64;
+        const uint8_t green = has22000 ? 24 : 64;
         setStatusLed(ledOn ? red : 0, ledOn ? green : 0, 0);
     }
 }

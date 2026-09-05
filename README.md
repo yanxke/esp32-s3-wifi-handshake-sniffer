@@ -68,7 +68,7 @@ esp32-s3-whs
 - RGB 灯（GPIO48）绿色常亮表示空闲。
 - 黄色常亮表示正在抓包但尚未捕获数据包。
 - 捕获数据包后黄色闪烁，初始为每 2 秒一个闪烁周期，随着数据包数量增加加快，最高 5 Hz。
-- 检测到 PMKID（`.22000` 内容非空）后，闪烁颜色变为橙色。
+- 生成可用 `.22000` 内容（PMKID 或 EAPOL）后，闪烁颜色变为橙色。
 
 4. 打开设备管理页面，默认地址通常为：
 
@@ -93,7 +93,7 @@ stop   - 停止抓包，保存结果，并恢复管理热点
 ## 输出文件
 
 - `latest_capture.pcap`：最近一次抓包结果，可用于 Wireshark 等工具分析
-- `latest_capture.22000`：PMKID hashcat 22000 格式输出
+- `latest_capture.22000`：PMKID/EAPOL hashcat 22000 格式输出
 - `latest_capture.json`：抓包会话元数据，包括信道、帧数量、EAPOL/PMKID 数量和耗时等
 - `session_XXXXXX.*`：历史会话归档文件
 
@@ -180,7 +180,7 @@ The device also prints each scanned SSID, BSSID, channel, RSSI, and security typ
 ## Output Files
 
 - `latest_capture.pcap`: latest capture, suitable for analysis with Wireshark and similar tools
-- `latest_capture.22000`: PMKID output in Hashcat 22000 format
+- `latest_capture.22000`: PMKID/EAPOL output in Hashcat 22000 format
 - `latest_capture.json`: capture metadata including channel, frame counts, EAPOL/PMKID counts, and elapsed time
 - `session_XXXXXX.*`: archived files from previous sessions
 
@@ -200,7 +200,7 @@ The device also prints each scanned SSID, BSSID, channel, RSSI, and security typ
 - Solid green RGB (GPIO48) means idle.
 - Solid yellow means capture is running but no packets have been captured yet.
 - After packets are captured, the LED blinks yellow, starting at one cycle every 2 seconds and increasing up to 5 Hz as the packet count grows.
-- After a PMKID is detected (non-empty `.22000` data), the blinking color changes to orange.
+- After usable `.22000` data is generated (PMKID or EAPOL), the blinking color changes to orange.
 
 ## Build And Flash
 
