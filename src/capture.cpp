@@ -1262,8 +1262,20 @@ uint8_t replayPairMarker(uint8_t base, uint64_t a, uint64_t b) {
 }
 
 bool eapolPairAvailable(const EapolCandidate& candidate, uint64_t referenceReplay) {
-    return candidate.valid && candidate.len > 0 &&
-           replayPairAcceptable(referenceReplay, candidate.replay);
+    if (!candidate.valid || candidate.len == 0 ||
+        !replayPairAcceptable(referenceReplay, candidate.replay)) {
+        return false;
+    }
+
+    bool noncePresent = false;
+    bool micPresent = false;
+    for (size_t i = 0; i < sizeof(candidate.nonce); ++i) {
+        noncePresent = noncePresent || candidate.nonce[i] != 0;
+    }
+    for (size_t i = 0; i < sizeof(candidate.mic); ++i) {
+        micPresent = micPresent || candidate.mic[i] != 0;
+    }
+    return noncePresent && micPresent;
 }
 
 void appendEapolRecord(String& out, const HandshakeState& hs,
@@ -1364,21 +1376,19 @@ const char* getPmkidData() {
         pmkidBuf += "***\n";
     }
 
-    // Export bounded, replay-checked EAPOL pair candidates. The MIC is
-    // preserved in field 2 and zeroed in the EAPOL field.
+    // Export the same preferred EAPOL pairing as hcxtools' default output.
+    // The MIC is preserved in field 2 and zeroed in the EAPOL field. M2 is
+    // preferred because it contains the client SNonce and produces Hash 1.
     for (const auto& hs : handshakes) {
         if (!hs.used || !hs.m1) continue;
-        if (hs.m3Data.valid) {
-            // Match hcxtools' preferred pairing: use the AP's M3 nonce with
-            // the client M2 EAPOL. A replay mismatch is represented by the
-            // high bit, producing the usual M32E2/0x82 form when needed.
+        if (hs.m3Data.valid && eapolPairAvailable(hs.m2Data, hs.m3Data.replay)) {
+            // M2 EAPOL + M3 ANonce is hcxtools' preferred M32E2 pairing.
+            // A replay mismatch is represented by the high bit, producing
+            // the usual M32E2/0x82 form when needed.
             appendEapolRecord(pmkidBuf, hs, hs.m2Data, hs.m3Data.nonce, hs.m3Data.replay, 2);
-        }
-        appendEapolRecord(pmkidBuf, hs, hs.m2Data, hs.anonce, hs.m1Replay, 0);
-        appendEapolRecord(pmkidBuf, hs, hs.m4Data, hs.anonce, hs.m1Replay, 1);
-        if (hs.m3Data.valid) {
-            appendEapolRecord(pmkidBuf, hs, hs.m3Data, hs.m3Data.nonce, hs.m3Data.replay, 3);
-            appendEapolRecord(pmkidBuf, hs, hs.m4Data, hs.m3Data.nonce, hs.m3Data.replay, 5);
+        } else {
+            // If M3 was not captured, M1+M2 is the usable fallback.
+            appendEapolRecord(pmkidBuf, hs, hs.m2Data, hs.anonce, hs.m1Replay, 0);
         }
     }
     return pmkidBuf.c_str();
@@ -1395,9 +1405,6 @@ bool has22000Data() {
         if (!hs.used || !hs.m1) continue;
         if (hs.m3Data.valid && eapolPairAvailable(hs.m2Data, hs.m3Data.replay)) return true;
         if (eapolPairAvailable(hs.m2Data, hs.m1Replay)) return true;
-        if (eapolPairAvailable(hs.m4Data, hs.m1Replay)) return true;
-        if (hs.m3Data.valid && eapolPairAvailable(hs.m3Data, hs.m3Data.replay)) return true;
-        if (hs.m3Data.valid && eapolPairAvailable(hs.m4Data, hs.m3Data.replay)) return true;
     }
     return false;
 }
