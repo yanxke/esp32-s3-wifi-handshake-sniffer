@@ -473,6 +473,13 @@ void analyzeKey(const uint8_t* pkt, uint16_t len, int off) {
 
     eapolCount++;
 
+    // Hashcat 22000 and hcxtools do not support key-descriptor version 0.
+    // Some captures advertise an AKM/RSN PMKID while still using KDV 0
+    // (for example key-info 0x0088/0x13C8); exporting those as WPA*01/02
+    // produces records that look valid but cannot be verified by hashcat.
+    const uint8_t keyDescriptorVersion = ki & 0x07;
+    if (keyDescriptorVersion == 0 || keyDescriptorVersion > 3) return;
+
     uint8_t sa[6], da[6];
     getAddrs(pkt, sa, da);
 
