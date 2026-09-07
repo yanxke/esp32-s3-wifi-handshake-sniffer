@@ -35,6 +35,7 @@ constexpr size_t MAX_PMKID = 10;
 constexpr size_t MAX_NETWORKS = 8;
 constexpr size_t MAX_ESSID_LEN = 32;
 constexpr uint32_t CHECKPOINT_INTERVAL_MS = 60000;
+constexpr uint32_t CHANNEL_ROTATION_INTERVAL_MS = 10UL * 60UL * 1000UL;
 
 bool     fullChannelMode  = false;
 Preferences capturePreferences;
@@ -45,12 +46,20 @@ uint8_t savedChannel = 1;
 uint8_t savedBssid[6] = {0};
 char    savedBssidText[18] = "";
 String  savedEssid;
+std::array<TargetNetwork, MAX_TARGETS> savedTargets;
+size_t  savedTargetCount = 0;
 bool     apActive         = true;
 bool     fsReady          = false;
 bool     latestPcapKnown  = false;
 bool     latestPmkidKnown = false;
 bool     latestMetaKnown  = false;
 uint8_t  targetBssid[6]   = {0};
+std::array<TargetNetwork, MAX_TARGETS> activeTargets;
+size_t   activeTargetCount = 0;
+std::array<uint8_t, MAX_TARGETS> activeChannels;
+size_t   activeChannelCount = 0;
+size_t   activeChannelIndex = 0;
+uint32_t lastChannelSwitchMs = 0;
 char     capSummary[160]  = "";
 char     lastError[160]   = "";
 size_t   pcapWritePos     = 0;
@@ -248,14 +257,19 @@ bool matchesTarget(const uint8_t* pkt, uint16_t len) {
     uint8_t fc = pkt[0];
     uint8_t type = (fc >> 2) & 0x03;
 
-    if (type == 0) {
-        return sameMac(pkt + 16, targetBssid);
-    }
+    for (size_t i = 0; i < activeTargetCount; ++i) {
+        if (activeTargets[i].channel != captureChannel) continue;
 
-    if (type == 2) {
-        return sameMac(pkt + 4, targetBssid) ||
-               sameMac(pkt + 10, targetBssid) ||
-               sameMac(pkt + 16, targetBssid);
+        const uint8_t* bssid = activeTargets[i].bssid;
+        if (type == 0 && sameMac(pkt + 16, bssid)) {
+            return true;
+        }
+
+        if (type == 2 && (sameMac(pkt + 4, bssid) ||
+                          sameMac(pkt + 10, bssid) ||
+                          sameMac(pkt + 16, bssid))) {
+            return true;
+        }
     }
 
     return false;
@@ -668,51 +682,121 @@ bool parseSavedBssid(const char* text, uint8_t out[6]) {
     return true;
 }
 
-void saveCaptureConfig(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* essid) {
-    savedChannel = channel;
-    savedFullChannel = fullChannel;
-    savedEssid = (essid && !fullChannel) ? String(essid) : String();
-    const bool channelWritten = capturePreferences.putUChar("channel", channel) == sizeof(channel);
-    const bool modeWritten = capturePreferences.putBool("full", fullChannel) == sizeof(uint8_t);
-    bool bssidWritten = false;
-    if (bssid) {
-        memcpy(savedBssid, bssid, sizeof(savedBssid));
-        // NVS uses the same colon-separated representation that
-        // parseSavedBssid() expects during boot. Keep macStr() compact for
-        // capture diagnostics and generated metadata.
-        snprintf(savedBssidText, sizeof(savedBssidText),
-                 "%02X:%02X:%02X:%02X:%02X:%02X",
-                 savedBssid[0], savedBssid[1], savedBssid[2],
-                 savedBssid[3], savedBssid[4], savedBssid[5]);
-        bssidWritten = capturePreferences.putString("bssid", savedBssidText) == strlen(savedBssidText);
-    } else {
-        memset(savedBssid, 0, sizeof(savedBssid));
-        savedBssidText[0] = '\0';
-        bssidWritten = !capturePreferences.isKey("bssid") || capturePreferences.remove("bssid");
+bool normalizeTargets(const TargetNetwork* targets, size_t count,
+                      std::array<TargetNetwork, MAX_TARGETS>& out,
+                      size_t& outCount) {
+    outCount = 0;
+    if (!targets || count == 0) return false;
+
+    for (size_t i = 0; i < count && outCount < MAX_TARGETS; ++i) {
+        if (targets[i].channel < 1 || targets[i].channel > 14) continue;
+
+        bool duplicate = false;
+        for (size_t j = 0; j < outCount; ++j) {
+            if (sameMac(out[j].bssid, targets[i].bssid)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        out[outCount] = targets[i];
+        out[outCount].ssid[sizeof(out[outCount].ssid) - 1] = '\0';
+        ++outCount;
     }
 
-    // Preferences commits each put operation synchronously. Read all fields
-    // back immediately so a failed NVS write cannot look like a saved config.
-    const uint8_t storedChannel = capturePreferences.getUChar("channel", 0);
-    const bool storedFullChannel = capturePreferences.getBool("full", !fullChannel);
-    const String storedBssid = capturePreferences.isKey("bssid")
-                                   ? capturePreferences.getString("bssid", "")
-                                   : String();
+    return outCount > 0;
+}
+
+void rebuildActiveChannels() {
+    activeChannelCount = 0;
+    activeChannelIndex = 0;
+    for (size_t i = 0; i < activeTargetCount; ++i) {
+        bool known = false;
+        for (size_t j = 0; j < activeChannelCount; ++j) {
+            if (activeChannels[j] == activeTargets[i].channel) {
+                known = true;
+                break;
+            }
+        }
+        if (!known && activeChannelCount < activeChannels.size()) {
+            activeChannels[activeChannelCount++] = activeTargets[i].channel;
+        }
+    }
+}
+
+bool saveTargetConfigurationInternal(const TargetNetwork* targets, size_t count) {
+    std::array<TargetNetwork, MAX_TARGETS> normalized;
+    size_t normalizedCount = 0;
+    if (!normalizeTargets(targets, count, normalized, normalizedCount)) return false;
+
+    savedTargets = normalized;
+    savedTargetCount = normalizedCount;
+    savedFullChannel = false;
+    savedChannel = savedTargets[0].channel;
+    memcpy(savedBssid, savedTargets[0].bssid, sizeof(savedBssid));
+    snprintf(savedBssidText, sizeof(savedBssidText),
+             "%02X:%02X:%02X:%02X:%02X:%02X",
+             savedBssid[0], savedBssid[1], savedBssid[2],
+             savedBssid[3], savedBssid[4], savedBssid[5]);
+    savedEssid = savedTargets[0].ssid;
+
+    const size_t targetBytes = normalizedCount * sizeof(TargetNetwork);
+    const bool targetsWritten = capturePreferences.putBytes("targets", normalized.data(), targetBytes) == targetBytes;
+    const bool countWritten = capturePreferences.putUChar("target_count", (uint8_t)normalizedCount) == sizeof(uint8_t);
+    const bool channelWritten = capturePreferences.putUChar("channel", savedChannel) == sizeof(savedChannel);
+    const bool modeWritten = capturePreferences.putBool("full", false) == sizeof(uint8_t);
+    const bool bssidWritten = capturePreferences.putString("bssid", savedBssidText) == strlen(savedBssidText);
     const bool essidWritten = capturePreferences.putString("ssid", savedEssid) == savedEssid.length();
-    const String storedEssid = capturePreferences.getString("ssid", "");
-    const bool verified = channelWritten && modeWritten && bssidWritten && essidWritten &&
-                          storedChannel == channel &&
-                          storedFullChannel == fullChannel &&
-                          (fullChannel ? storedBssid.length() == 0 : storedBssid == savedBssidText) &&
-                          storedEssid == savedEssid;
+
+    const bool verified = targetsWritten && countWritten && channelWritten && modeWritten &&
+                          bssidWritten && essidWritten &&
+                          capturePreferences.getUChar("target_count", 0) == normalizedCount &&
+                          capturePreferences.getBytesLength("targets") == targetBytes;
     savedConfigValid = verified;
 
-    Serial.printf("[Capture] NVS config save: write=%s verify=%s mode=%s channel=%u bssid=%s\n",
-                  (channelWritten && modeWritten && bssidWritten) ? "ok" : "FAIL",
+    Serial.printf("[Capture] NVS config save: write=%s verify=%s mode=target targets=%u\n",
+                  (targetsWritten && countWritten && channelWritten && modeWritten) ? "ok" : "FAIL",
                   verified ? "ok" : "FAIL",
-                  storedFullChannel ? "full" : "target",
-                  storedChannel,
-                  storedBssid.length() ? storedBssid.c_str() : "<all>");
+                  (unsigned)normalizedCount);
+    return verified;
+}
+
+void saveCaptureConfig(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* essid) {
+    if (!fullChannel && !bssid) return;
+
+    if (!fullChannel) {
+        TargetNetwork target;
+        memcpy(target.bssid, bssid, sizeof(target.bssid));
+        target.channel = channel;
+        if (essid) strncpy(target.ssid, essid, sizeof(target.ssid) - 1);
+        target.ssid[sizeof(target.ssid) - 1] = '\0';
+        saveTargetConfigurationInternal(&target, 1);
+        return;
+    }
+
+    savedChannel = channel;
+    savedFullChannel = true;
+    savedTargetCount = 0;
+    savedTargets = {};
+    savedEssid = String();
+    memset(savedBssid, 0, sizeof(savedBssid));
+    savedBssidText[0] = '\0';
+    const bool channelWritten = capturePreferences.putUChar("channel", channel) == sizeof(channel);
+    const bool modeWritten = capturePreferences.putBool("full", true) == sizeof(uint8_t);
+    const bool bssidWritten = !capturePreferences.isKey("bssid") || capturePreferences.remove("bssid");
+    const bool targetsRemoved = !capturePreferences.isKey("targets") || capturePreferences.remove("targets");
+    const bool countRemoved = !capturePreferences.isKey("target_count") || capturePreferences.remove("target_count");
+    const bool essidWritten = capturePreferences.putString("ssid", "") == 0;
+    savedConfigValid = channelWritten && modeWritten && bssidWritten && targetsRemoved &&
+                       countRemoved && essidWritten &&
+                       capturePreferences.getUChar("channel", 0) == channel &&
+                       capturePreferences.getBool("full", false);
+
+    Serial.printf("[Capture] NVS config save: write=%s verify=%s mode=full channel=%u\n",
+                  (channelWritten && modeWritten) ? "ok" : "FAIL",
+                  savedConfigValid ? "ok" : "FAIL",
+                  channel);
 }
 
 void archiveExistingSession() {
@@ -931,8 +1015,34 @@ void setup() {
                                  : String();
     savedEssid = capturePreferences.getString("ssid", "");
     savedBssidString.toCharArray(savedBssidText, sizeof(savedBssidText));
+    savedTargets = {};
+    savedTargetCount = 0;
+    if (!savedFullChannel) {
+        const uint8_t storedCount = capturePreferences.getUChar("target_count", 0);
+        const size_t targetBytes = size_t(storedCount) * sizeof(TargetNetwork);
+        if (storedCount > 0 && storedCount <= MAX_TARGETS &&
+            capturePreferences.getBytesLength("targets") == targetBytes &&
+            capturePreferences.getBytes("targets", savedTargets.data(), targetBytes) == targetBytes) {
+            savedTargetCount = storedCount;
+        } else if (parseSavedBssid(savedBssidText, savedBssid)) {
+            // Migrate the original single-target configuration in memory.
+            savedTargetCount = 1;
+            memcpy(savedTargets[0].bssid, savedBssid, sizeof(savedBssid));
+            savedTargets[0].channel = savedChannel;
+            savedEssid.toCharArray(savedTargets[0].ssid, sizeof(savedTargets[0].ssid));
+        }
+        if (savedTargetCount > 0) {
+            savedChannel = savedTargets[0].channel;
+            memcpy(savedBssid, savedTargets[0].bssid, sizeof(savedBssid));
+            savedEssid = savedTargets[0].ssid;
+            snprintf(savedBssidText, sizeof(savedBssidText),
+                     "%02X:%02X:%02X:%02X:%02X:%02X",
+                     savedBssid[0], savedBssid[1], savedBssid[2],
+                     savedBssid[3], savedBssid[4], savedBssid[5]);
+        }
+    }
     savedConfigValid = capturePreferences.isKey("channel") &&
-                       (savedFullChannel || parseSavedBssid(savedBssidText, savedBssid));
+                       (savedFullChannel || savedTargetCount > 0);
 
     pmkidBuf.reserve(512);
     fsReady = LittleFS.begin(true);
@@ -949,25 +1059,49 @@ void setup() {
     }
 }
 
-void start(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* essid) {
+void startInternal(uint8_t channel, const TargetNetwork* targets, size_t targetCount,
+                   bool fullChannel, const char* essid) {
     if (isRunning) stop();
 
     lastError[0] = '\0';
-    if (!fullChannel && !bssid) {
+    std::array<TargetNetwork, MAX_TARGETS> normalizedTargets;
+    size_t normalizedTargetCount = 0;
+    if (!fullChannel && !normalizeTargets(targets, targetCount,
+                                          normalizedTargets, normalizedTargetCount)) {
         strncpy(lastError, "missing target bssid", sizeof(lastError) - 1);
         return;
     }
+    if (fullChannel && (channel < 1 || channel > 14)) {
+        strncpy(lastError, "invalid channel", sizeof(lastError) - 1);
+        return;
+    }
 
-    saveCaptureConfig(channel, bssid, fullChannel, essid);
-    captureEssid = (essid && !fullChannel) ? String(essid) : String();
+    if (fullChannel) {
+        saveCaptureConfig(channel, nullptr, true, nullptr);
+        activeTargetCount = 0;
+        activeChannelCount = 1;
+        activeChannelIndex = 0;
+        activeChannels[0] = channel;
+    } else {
+        saveTargetConfigurationInternal(normalizedTargets.data(), normalizedTargetCount);
+        activeTargets = normalizedTargets;
+        activeTargetCount = normalizedTargetCount;
+        rebuildActiveChannels();
+        channel = activeChannels[0];
+        memcpy(targetBssid, activeTargets[0].bssid, sizeof(targetBssid));
+    }
+
+    captureEssid = (!fullChannel && normalizedTargetCount > 0)
+                       ? String(normalizedTargets[0].ssid)
+                       : String();
+    if (!captureEssid.length() && essid && !fullChannel) captureEssid = String(essid);
     resumeOnBoot = true;
     const bool resumeWritten = capturePreferences.putBool("resume", true) == sizeof(uint8_t);
     Serial.printf("[Capture] Resume-on-boot state saved: %s\n", resumeWritten ? "running" : "FAILED");
 
     fullChannelMode = fullChannel;
     captureChannel = channel;
-    if (bssid) memcpy(targetBssid, bssid, 6);
-    else memset(targetBssid, 0, sizeof(targetBssid));
+    if (fullChannel) memset(targetBssid, 0, sizeof(targetBssid));
 
     frameCount = 0;
     eapolCount = 0;
@@ -984,6 +1118,7 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* 
     startMs = millis();
     lastDiagMs = startMs;
     lastCheckpointMs = startMs;
+    lastChannelSwitchMs = startMs;
     rawChannelFrames = 0;
     savedBeaconFrames = 0;
     savedProbeRespFrames = 0;
@@ -1047,8 +1182,42 @@ void start(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* 
                   captureChannel, fullChannelMode ? "full" : "target",
                   fullChannelMode ? "<all>" : bssidStr,
                   captureEssid.length() ? captureEssid.c_str() : "<empty>");
+    Serial.printf("[Capture] Targets=%u unique channels=%u rotation=%s\n",
+                  (unsigned)activeTargetCount,
+                  (unsigned)activeChannelCount,
+                  activeChannelCount > 1 ? "10 minutes" : "disabled");
     Serial.println("[Capture] WiFi mode=STA promiscuous");
     Serial.println("[Capture] Waiting for matching traffic...");
+}
+
+void start(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* essid) {
+    if (fullChannel) {
+        startInternal(channel, nullptr, 0, true, nullptr);
+        return;
+    }
+    if (!bssid) {
+        strncpy(lastError, "missing target bssid", sizeof(lastError) - 1);
+        return;
+    }
+
+    TargetNetwork target;
+    memcpy(target.bssid, bssid, sizeof(target.bssid));
+    target.channel = channel;
+    if (essid) strncpy(target.ssid, essid, sizeof(target.ssid) - 1);
+    target.ssid[sizeof(target.ssid) - 1] = '\0';
+    startInternal(channel, &target, 1, false, essid);
+}
+
+bool startTargets(const TargetNetwork* targets, size_t count) {
+    std::array<TargetNetwork, MAX_TARGETS> normalized;
+    size_t normalizedCount = 0;
+    if (!normalizeTargets(targets, count, normalized, normalizedCount)) return false;
+    startInternal(normalized[0].channel, normalized.data(), normalizedCount, false, nullptr);
+    return isRunning;
+}
+
+bool saveTargetConfiguration(const TargetNetwork* targets, size_t count) {
+    return saveTargetConfigurationInternal(targets, count);
 }
 
 void saveConfiguration(uint8_t channel, const uint8_t* bssid, bool fullChannel, const char* essid) {
@@ -1064,7 +1233,7 @@ void startSaved(bool preserveSavedFiles) {
     } else if (savedFullChannel) {
         start(savedChannel, nullptr, true, nullptr);
     } else {
-        start(savedChannel, savedBssid, false, savedEssid.c_str());
+        startTargets(savedTargets.data(), savedTargetCount);
     }
     preserveSavedFilesOnStart = false;
 }
@@ -1094,6 +1263,16 @@ bool usesSavedFullChannel() {
 
 const char* getSavedBssid() {
     return savedBssidText;
+}
+
+size_t getSavedTargetCount() {
+    return savedTargetCount;
+}
+
+bool getSavedTarget(size_t index, TargetNetwork& out) {
+    if (index >= savedTargetCount) return false;
+    out = savedTargets[index];
+    return true;
 }
 
 void stop() {
@@ -1155,11 +1334,32 @@ void stop() {
     startManagementAp();
 }
 
+void rotateChannelIfDue(uint32_t now) {
+    if (fullChannelMode || activeChannelCount <= 1 ||
+        now - lastChannelSwitchMs < CHANNEL_ROTATION_INTERVAL_MS) {
+        return;
+    }
+
+    activeChannelIndex = (activeChannelIndex + 1) % activeChannelCount;
+    const uint8_t nextChannel = activeChannels[activeChannelIndex];
+    const esp_err_t result = esp_wifi_set_channel(nextChannel, WIFI_SECOND_CHAN_NONE);
+    if (result == ESP_OK) {
+        captureChannel = nextChannel;
+        Serial.printf("[Capture] Rotating to channel %u after 10 minutes\n",
+                      captureChannel);
+    } else {
+        Serial.printf("[Capture] Channel rotation to %u failed: %d\n",
+                      nextChannel, (int)result);
+    }
+    lastChannelSwitchMs = now;
+}
+
 void loop() {
     if (!isRunning) return;
+    const uint32_t now = millis();
+    rotateChannelIfDue(now);
     flushPendingPcapChunk();
 
-    uint32_t now = millis();
     const bool newPcapData = pcapWritePos != lastCheckpointPcapPos;
     const bool newPmkidData = pmkidCount != lastCheckpointPmkidCount;
     const bool checkpointDue = now - lastCheckpointMs >= CHECKPOINT_INTERVAL_MS;
