@@ -4,6 +4,14 @@
 #include "capture.h"
 #include "web.h"
 
+#ifndef RGB_LED_GPIO
+#ifdef RGB_BUILTIN
+#define RGB_LED_GPIO RGB_BUILTIN
+#else
+#define RGB_LED_GPIO 48
+#endif
+#endif
+
 namespace {
 
 constexpr const char* kProjectName = "ESP32-S3 WiFi Handshake Sniffer";
@@ -25,7 +33,13 @@ void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
     ledRed = red;
     ledGreen = green;
     ledBlue = blue;
-    neopixelWrite(RGB_BUILTIN, red, green, blue);
+#ifdef RGB_LED_ORDER_RGB
+    // neopixelWrite() expects RGB values but sends them in GRB order. Swap
+    // red and green here for LEDs whose physical order is RGB.
+    neopixelWrite(RGB_LED_GPIO, green, red, blue);
+#else
+    neopixelWrite(RGB_LED_GPIO, red, green, blue);
+#endif
 }
 
 void updateStatusLed() {
